@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +16,12 @@
 use crate::drain;
 use crate::drain::DrainTrigger;
 use std::sync::Arc;
-use tracing::{Instrument, debug, info};
+use tokio::sync::mpsc;
+use tracing::{Instrument, debug, error, info};
 
 use super::{Error, WorkloadMessage, metrics::Metrics};
 
+use crate::firewall::FirewallEvent;
 use crate::proxyfactory::ProxyFactory;
 use crate::state::WorkloadInfo;
 
@@ -76,6 +79,8 @@ pub struct WorkloadProxyManagerState {
     snapshot_names: std::collections::HashSet<WorkloadUid>,
 
     inpod_config: InPodConfig,
+
+    fw_tx: Option<mpsc::UnboundedSender<FirewallEvent>>,
 }
 
 impl WorkloadProxyManagerState {
@@ -84,6 +89,7 @@ impl WorkloadProxyManagerState {
         inpod_config: InPodConfig,
         metrics: Arc<Metrics>,
         admin_handler: Arc<super::admin::WorkloadManagerAdminHandler>,
+        fw_tx: Option<mpsc::UnboundedSender<FirewallEvent>>,
     ) -> Self {
         WorkloadProxyManagerState {
             proxy_gen,
@@ -96,6 +102,7 @@ impl WorkloadProxyManagerState {
             snapshot_received: false,
             snapshot_names: Default::default(),
             inpod_config,
+            fw_tx,
         }
     }
 
@@ -207,10 +214,12 @@ impl WorkloadProxyManagerState {
     // reconcile existing state to snaphsot. drains any workloads not in the snapshot
     // this can happen if workloads were removed while we were disconnected.
     fn reconcile(&mut self) {
-        for (_, workload_state) in self
+        let removed: Vec<_> = self
             .workload_states
             .extract_if(|uid, _| !self.snapshot_names.contains(uid))
-        {
+            .collect();
+        for (uid, workload_state) in removed {
+            self.send_fw_event(FirewallEvent::RemovePod { uid });
             self.draining.shutdown_workload(workload_state);
         }
         self.snapshot_names.clear();
@@ -246,6 +255,13 @@ impl WorkloadProxyManagerState {
                 Ok(())
             }
             Err(e) => {
+                // Send firewall event even on proxy failure — firewall rules are
+                // useful independently (e.g. default-deny protection).
+                self.send_fw_event(FirewallEvent::AddPod {
+                    uid: workload_uid.clone(),
+                    info: workload_info.clone(),
+                    netns: netns.clone(),
+                });
                 self.pending_workloads
                     .insert(workload_uid.clone(), (workload_info, netns));
                 self.update_proxy_count_metrics();
@@ -296,7 +312,7 @@ impl WorkloadProxyManagerState {
             .new_proxies_from_factory(
                 Some(drain_rx),
                 workload_info.clone(),
-                Arc::from(self.inpod_config.socket_factory(netns)),
+                Arc::from(self.inpod_config.socket_factory(netns.clone())),
             )
             .await?;
 
@@ -331,6 +347,12 @@ impl WorkloadProxyManagerState {
                 netns_id: workload_netns_id,
             },
         );
+
+        self.send_fw_event(FirewallEvent::AddPod {
+            uid: workload_uid.clone(),
+            info: workload_info.clone(),
+            netns,
+        });
 
         Ok(())
     }
@@ -370,9 +392,24 @@ impl WorkloadProxyManagerState {
             return;
         };
 
+        self.send_fw_event(FirewallEvent::RemovePod {
+            uid: workload_uid.clone(),
+        });
+
         self.update_proxy_count_metrics();
 
         self.draining.shutdown_workload(workload_state);
+    }
+
+    fn send_fw_event(&self, event: FirewallEvent) {
+        if let Some(tx) = &self.fw_tx {
+            if let Err(e) = tx.send(event) {
+                error!(
+                    "Failed to send firewall event (receiver closed), pod may lack firewall rules: {}",
+                    e
+                );
+            }
+        }
     }
 
     fn update_proxy_count_metrics(&self) {
@@ -421,6 +458,7 @@ mod tests {
                 f.ipc,
                 f.inpod_metrics.clone(),
                 Default::default(),
+                None,
             );
             Fixture {
                 state,

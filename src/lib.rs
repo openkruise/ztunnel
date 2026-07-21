@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,15 +25,19 @@ pub mod config;
 pub mod copy;
 pub mod dns;
 pub mod drain;
+pub mod extensions;
+pub mod firewall;
 pub mod hyper_util;
 pub mod identity;
 #[cfg(target_os = "linux")]
 pub mod inpod;
 pub mod metrics;
+pub mod probe;
 pub mod proxy;
 pub mod proxyfactory;
 pub mod rbac;
 pub mod readiness;
+pub mod sandbox;
 pub mod signal;
 pub mod socket;
 pub mod state;
@@ -41,6 +46,7 @@ pub mod telemetry;
 pub mod time;
 pub mod tls;
 pub mod version;
+pub mod watcher;
 pub mod xds;
 
 #[cfg(any(test, feature = "testing"))]

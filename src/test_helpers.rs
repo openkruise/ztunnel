@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,9 +17,7 @@ use crate::config::ConfigSource;
 use crate::config::{self, RootCert};
 use crate::state::service::{Endpoint, EndpointSet, Service};
 use crate::state::workload::InboundProtocol::{HBONE, TCP};
-use crate::state::workload::{
-    GatewayAddress, NamespacedHostname, NetworkAddress, Workload, gatewayaddress,
-};
+use crate::state::workload::{GatewayAddress, NetworkAddress, Workload, gatewayaddress};
 use crate::state::workload::{HealthStatus, InboundProtocol};
 use crate::state::{DemandProxyState, ProxyState};
 use crate::xds::istio::security::Authorization as XdsAuthorization;
@@ -26,7 +25,10 @@ use crate::xds::istio::workload::Address as XdsAddress;
 use crate::xds::istio::workload::Service as XdsService;
 use crate::xds::istio::workload::Workload as XdsWorkload;
 use crate::xds::istio::workload::address;
-use crate::xds::{Handler, LocalConfig, LocalWorkload, ProxyStateUpdater, XdsResource, XdsUpdate};
+use crate::xds::{
+    Handler, LocalConfig, LocalWorkload, ProxyStateUpdater, XdsResource, XdsUpdate,
+    XdsWorkloadConfig,
+};
 use anyhow::anyhow;
 use bytes::{BufMut, Bytes};
 use hickory_resolver::config::*;
@@ -227,6 +229,9 @@ pub fn test_default_workload() -> Workload {
         application_tunnel: None,
         locality: Default::default(),
         services: Default::default(),
+        encoded_labels: None,
+        egress_policies: None,
+        mesh_internal_traffic_policy: Default::default(),
     }
 }
 
@@ -424,6 +429,15 @@ pub fn new_proxy_state(
     xds_services: &[XdsService],
     xds_authorizations: &[XdsAuthorization],
 ) -> DemandProxyState {
+    new_proxy_state_with_workload_configs(xds_workloads, xds_services, xds_authorizations, &[])
+}
+
+pub fn new_proxy_state_with_workload_configs(
+    xds_workloads: &[XdsWorkload],
+    xds_services: &[XdsService],
+    xds_authorizations: &[XdsAuthorization],
+    workload_configs: &[(&str, XdsWorkloadConfig)],
+) -> DemandProxyState {
     let state = Arc::new(RwLock::new(ProxyState::new(None)));
     let updater = ProxyStateUpdater::new_no_fetch(state.clone());
 
@@ -457,6 +471,16 @@ pub fn new_proxy_state(
             resource: a.clone(),
         };
         let handler = &updater as &dyn Handler<XdsAuthorization>;
+        handler
+            .handle(Box::new(&mut vec![XdsUpdate::Update(res)].into_iter()))
+            .unwrap();
+    }
+    for (name, config) in workload_configs {
+        let res = XdsResource {
+            name: strng::new(name),
+            resource: config.clone(),
+        };
+        let handler = &updater as &dyn Handler<XdsWorkloadConfig>;
         handler
             .handle(Box::new(&mut vec![XdsUpdate::Update(res)].into_iter()))
             .unwrap();

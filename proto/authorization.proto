@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +19,7 @@ package istio.security;
 option go_package="pkg/workloadapi/security";
 
 import "google/protobuf/empty.proto";
+import "google/protobuf/any.proto";
 
 message Authorization {
   string name = 1;
@@ -38,6 +40,8 @@ message Authorization {
   // Whether or not this is a dry run policy.
   // Dry run policies are not enforced, but their matches are logged
   bool dry_run = 6;
+
+  repeated Extension auth_extensions = 999;
 }
 
 message Rule {
@@ -75,6 +79,25 @@ message Match {
 
   repeated uint32 destination_ports = 9;
   repeated uint32 not_destination_ports = 10;
+
+  repeated PortRange destination_port_ranges = 990;
+  repeated PortRange not_destination_port_ranges = 991;
+}
+
+message PortRange {
+  uint32 start = 1;
+  uint32 end = 2;
+  // Network protocol (e.g. "TCP", "UDP", "ICMP", "SCTP").
+  // Empty means any protocol.
+  Protocol protocol = 3;
+}
+
+enum Protocol {
+  ALL = 0;
+  TCP = 1;
+  UDP = 2;
+  ICMP = 3;
+  SCTP = 4;
 }
 
 message Address {
@@ -118,4 +141,16 @@ enum Action {
   ALLOW = 0;
   // Deny the request if it matches with the rules.
   DENY = 1;
+}
+
+
+// Extension provides a mechanism to attach arbitrary additional configuration to an object.
+// Extension provides a mechanism to attach arbitrary additional configuration to an object.
+message Extension {
+  // name provides an opaque name for the extension.
+  // This may have semantic meaning or used for debugging.
+  // This should be unique amongst all extensions attached to an item.
+  string name = 1;
+  // config provides some opaque configuration.
+  google.protobuf.Any config = 2;
 }

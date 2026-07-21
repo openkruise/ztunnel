@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +15,7 @@
 
 use crate::config;
 use crate::identity::SecretManager;
+use crate::sandbox::sandbox::SandboxManager;
 use crate::state::{DemandProxyState, WorkloadInfo};
 use crate::tls;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use tracing::error;
 use crate::dns;
 use crate::drain::DrainWatcher;
 
+use crate::firewall::metrics::Metrics as FirewallMetrics;
 use crate::proxy::connection_manager::ConnectionManager;
 use crate::proxy::{DefaultSocketFactory, Proxy, inbound::Inbound};
 use crate::proxy::{Error, LocalWorkloadInformation, Metrics};
@@ -36,6 +39,8 @@ pub struct ProxyFactory {
     dns_metrics: Option<Arc<dns::Metrics>>,
     drain: DrainWatcher,
     crl_manager: Option<Arc<tls::crl::CrlManager>>,
+    sandbox_manager: Option<Arc<SandboxManager>>,
+    firewall_metrics: Option<FirewallMetrics>,
 }
 
 impl ProxyFactory {
@@ -46,6 +51,8 @@ impl ProxyFactory {
         proxy_metrics: Arc<Metrics>,
         dns_metrics: Option<dns::Metrics>,
         drain: DrainWatcher,
+        sandbox_manager: Option<Arc<SandboxManager>>,
+        firewall_metrics: Option<FirewallMetrics>,
     ) -> std::io::Result<Self> {
         let dns_metrics = match dns_metrics {
             Some(metrics) => Some(Arc::new(metrics)),
@@ -95,6 +102,8 @@ impl ProxyFactory {
             dns_metrics,
             drain,
             crl_manager,
+            sandbox_manager,
+            firewall_metrics,
         })
     }
 
@@ -166,6 +175,8 @@ impl ProxyFactory {
                 local_workload_information,
                 false,
                 self.crl_manager.clone(),
+                self.sandbox_manager.clone(),
+                self.firewall_metrics.clone(),
             );
             result.connection_manager = Some(cm);
             result.proxy = Some(Proxy::from_inputs(pi, drain).await?);
@@ -212,6 +223,8 @@ impl ProxyFactory {
                 local_workload_information,
                 true,
                 self.crl_manager.clone(),
+                self.sandbox_manager.clone(),
+                None,
             );
 
             let inbound = Inbound::new(pi, self.drain.clone()).await?;

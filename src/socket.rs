@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +14,7 @@
 // limitations under the License.
 
 use std::io::Error;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::io;
 
@@ -41,6 +42,30 @@ pub fn set_freebind_and_transparent(socket: &TcpSocket) -> io::Result<()> {
         _ => return Err(Error::new(ErrorKind::Unsupported, "unsupported domain")),
     };
     Ok(())
+}
+
+pub const SELF_ADDR_V4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 6);
+pub const SELF_ADDR_V6: Ipv6Addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 6);
+
+pub fn is_self_addr(addr: IpAddr) -> bool {
+    match addr.to_canonical() {
+        IpAddr::V4(ip) => ip == SELF_ADDR_V4,
+        IpAddr::V6(ip) => ip == SELF_ADDR_V6,
+    }
+}
+
+pub fn to_self_addr(addr: IpAddr) -> IpAddr {
+    match addr.to_canonical() {
+        IpAddr::V4(_) => IpAddr::V4(SELF_ADDR_V4),
+        IpAddr::V6(_) => IpAddr::V6(SELF_ADDR_V6),
+    }
+}
+
+pub fn to_self_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(SELF_ADDR_V4), addr.port()),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(SELF_ADDR_V6), addr.port()),
+    }
 }
 
 pub fn to_canonical(addr: SocketAddr) -> SocketAddr {
@@ -179,9 +204,20 @@ impl Listener {
                 tracing::trace!("set keepalive: {:?}", res);
             }
             if cfg.user_timeout_enabled {
-                let ut = cfg.keepalive_time + cfg.keepalive_retries * cfg.keepalive_interval;
-                let res = SockRef::from(&stream).set_tcp_user_timeout(Some(ut));
-                tracing::trace!("set user timeout: {:?}", res);
+                // TCP_USER_TIMEOUT is a Linux-only socket option; socket2 only
+                // exposes set_tcp_user_timeout on Linux. On
+                // other platforms we silently no-op so the dev build works.
+                #[cfg(any(target_os = "linux",))]
+                {
+                    let ut = cfg.keepalive_time + cfg.keepalive_retries * cfg.keepalive_interval;
+                    let res = SockRef::from(&stream).set_tcp_user_timeout(Some(ut));
+                    tracing::trace!("set user timeout: {:?}", res);
+                }
+                #[cfg(not(any(target_os = "linux",)))]
+                {
+                    let _ = cfg;
+                    tracing::trace!("TCP_USER_TIMEOUT not supported on this platform, skipping");
+                }
             }
         }
         Ok((stream, remote))
@@ -238,7 +274,17 @@ pub mod socket_tests {
             sock.tcp_keepalive_interval().unwrap(),
             cfg.keepalive_interval
         );
-        let ut = cfg.keepalive_time + cfg.keepalive_retries * cfg.keepalive_interval;
-        assert_eq!(sock.tcp_user_timeout().unwrap(), Some(ut));
+        // TCP_USER_TIMEOUT is Linux only; socket2 doesn't
+        // expose the getter on other platforms either, so skip the assertion
+        // (the setter is already cfg-gated in `Listener::accept`).
+        #[cfg(any(target_os = "linux"))]
+        {
+            let ut = cfg.keepalive_time + cfg.keepalive_retries * cfg.keepalive_interval;
+            assert_eq!(sock.tcp_user_timeout().unwrap(), Some(ut));
+        }
+        #[cfg(not(any(target_os = "linux")))]
+        {
+            let _ = cfg;
+        }
     }
 }

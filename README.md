@@ -1,23 +1,12 @@
 # Ztunnel
 
-Ztunnel provides an implementation of the ztunnel component of
-[ambient mesh](https://istio.io/latest/blog/2022/introducing-ambient-mesh/).
+ztunnel is the Layer 4 traffic enforcement data plane for [Agentio](https://github.com/openkruise/agentio).
 
-## Feature Scope
+## How does it differ from Istio ztunnel?
 
-Ztunnel is intended to be a purpose built implementation of the node proxy in [ambient mesh](https://istio.io/latest/blog/2022/introducing-ambient-mesh/).
-Part of the goals of this included keeping a narrow feature set, implementing only the bare minimum requirements for ambient.
-This ensures the project remains simple and high performance.
-
-Explicitly out of scope for ztunnel include:
-* Terminating user HTTP traffic
-* Terminating user HTTP traffic (its worth repeating)
-* Generic extensibility such as `ext_authz`, WASM, linked-in extensions, Lua, etc.
-
-In general, ztunnel does not aim to be a generic extensible proxy; Envoy is better suited for that task.
-If a feature is not directly used to implement the node proxy component in ambient mesh, it is unlikely to be accepted.
-
-The details of architecture is [here](./ARCHITECTURE.md).
+- **Outbound traffic authorization** — applies CLIENT-mode authorization policies to outbound connections, with namespace, global, and workload scope plus priority-ordered ALLOW/DENY decisions.
+- **Non-TCP firewall enforcement** — translates priority authorization policies into inbound and outbound iptables or nftables rules for UDP, ICMP, and other supported non-TCP traffic, with automatic backend detection and live rule updates.
+- **Per-workload sidecar deployment** — runs a dedicated ztunnel alongside each sandbox workload instead of as a node-level proxy, enforcing traffic policy at the workload boundary.
 
 ## Building
 
@@ -159,3 +148,11 @@ Access logs are emitted upon _completion_ of each connection.
 Logs for connect _establishment_ are also logged (with less information) at `debug` level.
 
 Currently, the access log format is considered unstable and subject to changes.
+
+## License & Attribution
+
+ztunnel is licensed under the [Apache License 2.0](LICENSE).
+
+ztunnel is a modified derivative of [Istio ztunnel](https://github.com/istio/ztunnel) (Copyright Istio Authors, Apache License 2.0). The original Istio README is preserved at [README.istio](README.istio). Files derived from Istio that have been modified for this project carry a `Modifications Copyright 2026 The Kruise Authors` notice.
+
+**Trademark notice:** "Istio" is a trademark of its respective owners. ztunnel is an independent project and is not affiliated with, sponsored by, or endorsed by the Istio project. References to Istio describe the origin of the code only.

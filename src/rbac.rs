@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +18,7 @@ use ipnet::IpNet;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use tracing::{instrument, trace};
 use xds::istio::security::Address as XdsAddress;
 use xds::istio::security::Authorization as XdsRbac;
@@ -27,9 +29,26 @@ use xds::istio::security::string_match::MatchType;
 
 use crate::identity::Identity;
 
+use crate::extensions::extensions::AuthExtension;
 use crate::state::workload::{WorkloadError, byte_to_ip};
 use crate::strng::Strng;
+use crate::xds::kruise::networking::extensions::v1::TrafficPolicyMode;
 use crate::{strng, xds};
+use xds::istio::security::Protocol;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Hash, Ord, PartialOrd)]
+pub enum Direction {
+    Inbound,
+    Outbound,
+}
+
+impl Default for Direction {
+    fn default() -> Self {
+        // Inbound is the original (pre-direction) behavior path; defaulting
+        // here keeps `Connection::default()` matching the legacy semantics.
+        Direction::Inbound
+    }
+}
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -40,6 +59,26 @@ pub struct Authorization {
     pub action: RbacAction,
     pub rules: Vec<Vec<Vec<RbacMatch>>>,
     pub dry_run: bool,
+
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(skip)]
+    pub mode: TrafficPolicyMode,
+}
+
+impl Default for Authorization {
+    fn default() -> Self {
+        Authorization {
+            name: Strng::default(),
+            namespace: Strng::default(),
+            scope: RbacScope::Global,
+            action: RbacAction::Allow,
+            rules: Vec::new(),
+            dry_run: false,
+            priority: None,
+            mode: TrafficPolicyMode::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
@@ -48,6 +87,7 @@ pub struct Connection {
     pub dst: SocketAddr,
     pub src_identity: Option<Identity>,
     pub dst_network: Strng,
+    pub direction: Direction,
 }
 
 struct OptionDisplay<'a, T>(&'a Option<T>);
@@ -73,6 +113,26 @@ impl Display for Connection {
     }
 }
 
+pub enum RbacDecision {
+    Allow,
+    Deny,
+    NoMatch,
+}
+
+pub fn should_rbac_handle(protocol: i32) -> bool {
+    match Protocol::try_from(protocol) {
+        Ok(Protocol::Tcp) | Ok(Protocol::All) => true,
+        _ => false,
+    }
+}
+
+pub fn should_firewall_handle(protocol: i32) -> bool {
+    match Protocol::try_from(protocol) {
+        Ok(Protocol::Tcp) => false,
+        _ => true,
+    }
+}
+
 impl Authorization {
     pub fn to_key(&self) -> Strng {
         let mut res = String::with_capacity(1 + self.namespace.len() + self.name.len());
@@ -80,6 +140,157 @@ impl Authorization {
         res.push('/');
         res.push_str(&self.name);
         res.into()
+    }
+
+    #[instrument(level = "trace", skip_all, fields(policy=self.to_key().as_str()))]
+    pub fn match_with_decision(&self, conn: &Connection) -> RbacDecision {
+        let full_identity = conn.src_identity.as_ref();
+        let id = conn
+            .src_identity
+            .as_ref()
+            .map(|i| i.to_strng())
+            .unwrap_or_default();
+        let ns = conn
+            .src_identity
+            .as_ref()
+            .map(|i| match i {
+                Identity::Spiffe { namespace, .. } => namespace.to_owned(), // may be more clear if we use to_owned() to denote change from borrowed to owned
+            })
+            .unwrap_or_default();
+        if self.rules.is_empty() {
+            trace!(matches = false, "empty rules");
+            return RbacDecision::NoMatch;
+        }
+        // An Authorization Policy can have multiple rules
+        // If ANY rule matches it's a match...
+        for rule in self.rules.iter() {
+            // Rule typically has 1-3 clauses (from,to,when)
+            // If ALL clauses match, it is a match...
+            let mut rule_match = true;
+
+            // Determine the rule's polarity once: if ANY RbacMatch in the rule uses
+            // negative (not_*) fields, the rule is a deny rule. Otherwise it's allow.
+            //
+            // Invariant: a single rule must not mix positive and negative matchers.
+            // Mixing them is undefined - this function will treat the rule as deny
+            // and silently drop the positive constraints (see the if/else swap
+            // below). Authoring tools must enforce this at the source.
+            let positive = !rule
+                .iter()
+                .any(|clause| clause.iter().any(|mg| mg.is_negative()));
+
+            for clause in rule.iter() {
+                // We can have multiple mg (RbacMatch) in a clause, for example "Match ns=A,SA=B or ns=C"
+                // So we need ANY mg to match...
+                let mut clause_match = false;
+                for mg in clause.iter() {
+                    if mg.is_empty() {
+                        trace!(matches = false, "empty clause");
+                        continue;
+                    }
+
+                    let destination_ips = if positive {
+                        &mg.destination_ips
+                    } else {
+                        &mg.not_destination_ips
+                    };
+
+                    let source_ips = if positive {
+                        &mg.source_ips
+                    } else {
+                        &mg.not_source_ips
+                    };
+
+                    let destination_ports = if positive {
+                        &mg.destination_ports
+                    } else {
+                        &mg.not_destination_ports
+                    };
+
+                    let service_accounts = if positive {
+                        &mg.service_accounts
+                    } else {
+                        &mg.not_service_accounts
+                    };
+
+                    let principals = if positive {
+                        &mg.principals
+                    } else {
+                        &mg.not_principals
+                    };
+
+                    let namespaces = if positive {
+                        &mg.namespaces
+                    } else {
+                        &mg.not_namespaces
+                    };
+
+                    let destination_port_ranges = if positive {
+                        &mg.destination_port_ranges
+                    } else {
+                        &mg.not_destination_port_ranges
+                    };
+
+                    // We need ALL of these to match. Within each type, ANY must match
+                    let mut m = true;
+                    m &= Self::matches_internal("destination_ip", destination_ips, &vec![], |i| {
+                        i.contains(&conn.dst.ip())
+                    });
+                    m &= Self::matches_internal("source_ips", source_ips, &vec![], |i| {
+                        i.contains(&conn.src.ip())
+                    });
+                    m &= Self::matches_internal(
+                        "destination_ports",
+                        destination_ports,
+                        &vec![],
+                        |p| *p == conn.dst.port(),
+                    );
+                    m &= Self::matches_internal(
+                        "service_accounts",
+                        service_accounts,
+                        &vec![],
+                        |p| p.matches(&full_identity),
+                    );
+                    m &= Self::matches_internal("principals", principals, &vec![], |p| {
+                        p.matches_principal(&id)
+                    });
+                    m &= Self::matches_internal("namespaces", namespaces, &vec![], |p| {
+                        p.matches(&ns)
+                    });
+                    m &= Self::matches_internal(
+                        "destination_port_ranges",
+                        destination_port_ranges,
+                        &vec![],
+                        |p| should_rbac_handle(p.protocol) && p.range.contains(&conn.dst.port()),
+                    );
+                    if m {
+                        clause_match = true;
+                        break;
+                    }
+                }
+
+                if clause.is_empty() {
+                    clause_match = true;
+                    trace!(matches = clause_match, "empty clause");
+                } else {
+                    trace!(matches = clause_match, "clause");
+                }
+                rule_match &= clause_match;
+                if !rule_match {
+                    // Short circuit
+                    break;
+                }
+            }
+            trace!(matches = rule_match, "rule");
+            if rule_match {
+                if positive {
+                    return RbacDecision::Allow;
+                } else {
+                    return RbacDecision::Deny;
+                };
+            }
+        }
+        return RbacDecision::NoMatch;
     }
 
     #[instrument(level = "trace", skip_all, fields(policy=self.to_key().as_str()))]
@@ -155,6 +366,13 @@ impl Authorization {
                         |p| p.matches(&ns),
                     );
 
+                    m &= Self::matches_internal(
+                        "destination_port_ranges",
+                        &mg.destination_port_ranges,
+                        &mg.not_destination_port_ranges,
+                        |p| should_rbac_handle(p.protocol) && p.range.contains(&conn.dst.port()),
+                    );
+
                     if m {
                         clause_match = true;
                         break;
@@ -208,6 +426,13 @@ impl Authorization {
     }
 }
 
+#[derive(Debug, Hash, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortRangeMatch {
+    pub range: RangeInclusive<u16>,
+    pub protocol: i32,
+}
+
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RbacMatch {
@@ -235,9 +460,23 @@ pub struct RbacMatch {
     pub destination_ports: Vec<u16>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub not_destination_ports: Vec<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub destination_port_ranges: Vec<PortRangeMatch>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub not_destination_port_ranges: Vec<PortRangeMatch>,
 }
 
 impl RbacMatch {
+    pub fn is_negative(&self) -> bool {
+        !self.not_namespaces.is_empty()
+            || !self.not_service_accounts.is_empty()
+            || !self.not_principals.is_empty()
+            || !self.not_source_ips.is_empty()
+            || !self.not_destination_ips.is_empty()
+            || !self.not_destination_ports.is_empty()
+            || !self.not_destination_port_ranges.is_empty()
+    }
+
     fn is_empty(&self) -> bool {
         self.namespaces.is_empty()
             && self.not_namespaces.is_empty()
@@ -251,6 +490,8 @@ impl RbacMatch {
             && self.not_destination_ips.is_empty()
             && self.destination_ports.is_empty()
             && self.not_destination_ports.is_empty()
+            && self.destination_port_ranges.is_empty()
+            && self.not_destination_port_ranges.is_empty()
     }
 }
 
@@ -355,6 +596,17 @@ impl TryFrom<XdsRbac> for Authorization {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        let (priority, mode): (Option<i32>, Option<TrafficPolicyMode>) = resource
+            .auth_extensions
+            .into_iter()
+            .map(AuthExtension::from)
+            .find_map(|ext| match ext {
+                AuthExtension::TrafficPolicy(e) => Some((e.priority, e.mode.try_into().ok()?)),
+                _ => None,
+            })
+            .unzip();
+
         Ok(Authorization {
             name: strng::new(&resource.name),
             namespace: strng::new(&resource.namespace),
@@ -362,6 +614,8 @@ impl TryFrom<XdsRbac> for Authorization {
             action: RbacAction::from(xds::istio::security::Action::try_from(resource.action)?),
             rules,
             dry_run: resource.dry_run,
+            priority,
+            mode: mode.unwrap_or(TrafficPolicyMode::Server),
         })
     }
 }
@@ -418,6 +672,22 @@ impl TryFrom<&Match> for RbacMatch {
                 .not_destination_ports
                 .iter()
                 .map(|p| *p as u16)
+                .collect(),
+            destination_port_ranges: resource
+                .destination_port_ranges
+                .iter()
+                .map(|r| PortRangeMatch {
+                    range: r.start as u16..=r.end as u16,
+                    protocol: r.protocol,
+                })
+                .collect(),
+            not_destination_port_ranges: resource
+                .not_destination_port_ranges
+                .iter()
+                .map(|r| PortRangeMatch {
+                    range: r.start as u16..=r.end as u16,
+                    protocol: r.protocol,
+                })
                 .collect(),
         })
     }
@@ -486,6 +756,7 @@ mod tests {
             action: RbacAction::Allow,
             rules,
             dry_run: false,
+            ..Default::default()
         }
     }
 
@@ -495,6 +766,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:8080".parse().unwrap(),
+            direction: Direction::Inbound,
         }
     }
 
@@ -508,6 +780,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:8080".parse().unwrap(),
+            direction: Direction::Inbound,
         }
     }
 
@@ -521,6 +794,7 @@ mod tests {
             src: "127.0.0.3:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.4:9090".parse().unwrap(),
+            direction: Direction::Inbound,
         }
     }
 
@@ -571,6 +845,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
         assert!(pol.matches(&Connection {
             src_identity: Some(Identity::Spiffe {
@@ -581,6 +856,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
         // Policy is applied regardless of network
         assert!(pol.matches(&Connection {
@@ -592,6 +868,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "remote".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
         // Wrong namespace
         assert!(!pol.matches(&Connection {
@@ -603,6 +880,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
         // Wrong port
         assert!(!pol.matches(&Connection {
@@ -614,6 +892,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:12345".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
     }
 
@@ -642,6 +921,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
         assert!(pol.matches(&Connection {
             src_identity: Some(Identity::Spiffe {
@@ -652,6 +932,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
         // Wrong namespace
         assert!(!pol.matches(&Connection {
@@ -663,6 +944,7 @@ mod tests {
             src: "127.0.0.1:1234".parse().unwrap(),
             dst_network: "".into(),
             dst: "127.0.0.2:80".parse().unwrap(),
+            direction: Direction::Inbound,
         }));
     }
 
@@ -737,5 +1019,209 @@ mod tests {
     #[test_case(StringMatch::Presence(), "", false; "presence mismatch")]
     fn string_match(matcher: StringMatch, matchee: &str, expect: bool) {
         assert_eq!(matcher.matches(matchee), expect)
+    }
+
+    // ---------------------------------------------------------------------
+    // Tests for the additions made in the sandbox-mode commit:
+    //   * Authorization::match_with_decision (Allow / Deny / NoMatch)
+    //   * RbacMatch::destination_port_ranges / not_destination_port_ranges
+    //   * RbacMatch::is_empty extended to cover port_ranges
+    //   * Default impls for Authorization / Direction
+    // ---------------------------------------------------------------------
+
+    fn deny_policy(name: &str, rules: Vec<Vec<Vec<RbacMatch>>>) -> Authorization {
+        // Authorization::action is informational at this layer; the
+        // Allow/Deny decision is derived from rule polarity inside
+        // match_with_decision. We keep action=Deny here only for clarity.
+        Authorization {
+            name: name.into(),
+            namespace: "namespace".into(),
+            scope: RbacScope::Global,
+            action: RbacAction::Deny,
+            rules,
+            dry_run: false,
+            ..Default::default()
+        }
+    }
+
+    fn assert_decision(actual: RbacDecision, expected: &str) {
+        let got = match actual {
+            RbacDecision::Allow => "Allow",
+            RbacDecision::Deny => "Deny",
+            RbacDecision::NoMatch => "NoMatch",
+        };
+        assert_eq!(got, expected, "decision mismatch");
+    }
+
+    #[test]
+    fn decision_empty_rules_is_no_match() {
+        // A policy with no rules cannot match anything; the new tri-state API
+        // must return NoMatch, not Allow.
+        let pol = allow_policy("empty", vec![]);
+        assert_decision(pol.match_with_decision(&plaintext_conn()), "NoMatch");
+    }
+
+    #[test]
+    fn decision_positive_match_returns_allow() {
+        // Positive rule (no not_* fields) that fully matches the connection.
+        let pol = allow_policy(
+            "pos",
+            vec![vec![vec![RbacMatch {
+                destination_ports: vec![8080],
+                ..Default::default()
+            }]]],
+        );
+        assert_decision(pol.match_with_decision(&tls_conn()), "Allow");
+    }
+
+    #[test]
+    fn decision_negative_match_returns_deny() {
+        // A rule that uses any not_* field is treated as a deny rule. When the
+        // connection matches the deny criteria, the function must return Deny
+        // rather than Allow.
+        let pol = deny_policy(
+            "neg",
+            vec![vec![vec![RbacMatch {
+                not_destination_ports: vec![8080],
+                ..Default::default()
+            }]]],
+        );
+        // tls_conn() targets port 8080; the not_destination_ports field flips
+        // polarity so 8080 itself triggers the deny.
+        assert_decision(pol.match_with_decision(&tls_conn()), "Deny");
+    }
+
+    #[test]
+    fn decision_no_match_returns_no_match() {
+        // Connection's destination port does not satisfy the positive rule -
+        // the function falls through to NoMatch (NOT Deny).
+        let pol = allow_policy(
+            "miss",
+            vec![vec![vec![RbacMatch {
+                destination_ports: vec![9999],
+                ..Default::default()
+            }]]],
+        );
+        assert_decision(pol.match_with_decision(&tls_conn()), "NoMatch");
+    }
+
+    #[test]
+    fn destination_port_range_matches_port_inside_range() {
+        // 8080 falls inside [8000, 9000] -> match.
+        let pol = allow_policy(
+            "range-in",
+            vec![vec![vec![RbacMatch {
+                destination_port_ranges: vec![PortRangeMatch {
+                    range: 8000u16..=9000u16,
+                    protocol: 0,
+                }],
+                ..Default::default()
+            }]]],
+        );
+        assert!(pol.matches(&tls_conn()));
+    }
+
+    #[test]
+    fn destination_port_range_rejects_port_outside_range() {
+        // 8080 not in [9000, 10000] -> no match.
+        let pol = allow_policy(
+            "range-out",
+            vec![vec![vec![RbacMatch {
+                destination_port_ranges: vec![PortRangeMatch {
+                    range: 9000u16..=10000u16,
+                    protocol: 0,
+                }],
+                ..Default::default()
+            }]]],
+        );
+        assert!(!pol.matches(&tls_conn()));
+    }
+
+    #[test]
+    fn destination_port_range_with_multiple_ranges_any_match() {
+        // Multiple ranges within the same field are OR-ed: matching ANY range
+        // is enough to satisfy the destination_port_ranges constraint.
+        let pol = allow_policy(
+            "range-multi",
+            vec![vec![vec![RbacMatch {
+                destination_port_ranges: vec![
+                    PortRangeMatch {
+                        range: 1u16..=2u16,
+                        protocol: 0,
+                    },
+                    PortRangeMatch {
+                        range: 8000u16..=9000u16,
+                        protocol: 0,
+                    },
+                ],
+                ..Default::default()
+            }]]],
+        );
+        assert!(pol.matches(&tls_conn()));
+    }
+
+    #[test]
+    fn not_destination_port_range_denies_match_when_port_in_range() {
+        // match_with_decision detects not_destination_port_ranges and treats
+        // the rule as deny.
+        let pol = deny_policy(
+            "neg-range",
+            vec![vec![vec![RbacMatch {
+                not_destination_port_ranges: vec![PortRangeMatch {
+                    range: 8000u16..=9000u16,
+                    protocol: 0,
+                }],
+                ..Default::default()
+            }]]],
+        );
+        assert_decision(pol.match_with_decision(&tls_conn()), "Deny");
+    }
+
+    #[test]
+    fn rbac_match_is_empty_recognises_port_ranges() {
+        // The is_empty check is used to short-circuit empty clauses. After the
+        // commit added port_ranges fields, is_empty must also account for them
+        // - otherwise an `RbacMatch { destination_port_ranges: [..] }` would
+        // be wrongly classified as empty and skipped.
+        let m = RbacMatch {
+            destination_port_ranges: vec![PortRangeMatch {
+                range: 1u16..=2u16,
+                protocol: 0,
+            }],
+            ..Default::default()
+        };
+        assert!(!m.is_empty());
+
+        let m = RbacMatch {
+            not_destination_port_ranges: vec![PortRangeMatch {
+                range: 1u16..=2u16,
+                protocol: 0,
+            }],
+            ..Default::default()
+        };
+        assert!(!m.is_empty());
+
+        let m = RbacMatch::default();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn authorization_default_uses_conservative_baseline() {
+        // Default Authorization should be a no-op: empty rules + Allow action
+        // + Global scope. The `..Default::default()` spread in allow_policy
+        // relies on this being non-panicking.
+        let a = Authorization::default();
+        assert!(a.rules.is_empty());
+        assert!(matches!(a.scope, RbacScope::Global));
+        assert!(matches!(a.action, RbacAction::Allow));
+        assert!(!a.dry_run);
+        assert!(a.priority.is_none());
+    }
+
+    #[test]
+    fn direction_default_is_inbound() {
+        // Connection literal in tests relies on Direction::default() being a
+        // sensible value; Inbound preserves pre-sandbox-mode behavior.
+        assert_eq!(Direction::default(), Direction::Inbound);
     }
 }

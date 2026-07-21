@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +18,8 @@ use crate::proxy::Error;
 use crate::state::DemandProxyState;
 use crate::state::ProxyRbacContext;
 use serde::{Serialize, Serializer};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::fmt::Formatter;
 use std::net::SocketAddr;
 
@@ -57,8 +58,7 @@ impl ConnectionDrain {
 
 #[derive(Clone)]
 pub struct ConnectionManager {
-    drains: Arc<RwLock<HashMap<InboundConnection, ConnectionDrain>>>,
-    outbound_connections: Arc<RwLock<HashSet<OutboundConnection>>>,
+    drains: Arc<RwLock<HashMap<ConnectionContext, ConnectionDrain>>>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -71,14 +71,13 @@ impl Default for ConnectionManager {
     fn default() -> Self {
         ConnectionManager {
             drains: Arc::new(RwLock::new(HashMap::new())),
-            outbound_connections: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 }
 
 pub struct ConnectionGuard {
     cm: ConnectionManager,
-    conn: InboundConnection,
+    conn: ConnectionContext,
     watch: Option<DrainWatcher>,
 }
 
@@ -117,29 +116,16 @@ impl Drop for ConnectionGuard {
     }
 }
 
-pub struct OutboundConnectionGuard {
-    cm: ConnectionManager,
-    conn: OutboundConnection,
-}
-
-impl Drop for OutboundConnectionGuard {
-    fn drop(&mut self) {
-        self.cm.release_outbound(&self.conn)
-    }
-}
-
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OutboundConnection {
-    pub src: SocketAddr,
-    pub original_dst: SocketAddr,
+pub struct OutboundAttributes {
     pub actual_dst: SocketAddr,
     pub protocol: OutboundProtocol,
 }
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InboundConnectionDump {
+pub struct ConnectionDump {
     pub src: SocketAddr,
     pub original_dst: Option<String>,
     pub actual_dst: SocketAddr,
@@ -148,62 +134,44 @@ pub struct InboundConnectionDump {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InboundConnection {
-    #[serde(flatten)]
-    pub ctx: ProxyRbacContext,
+pub struct InboundAttributes {
     pub dest_service: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize)]
+pub enum ConnectionAttributes {
+    Inbound(InboundAttributes),
+    Outbound(OutboundAttributes),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, serde::Serialize)]
+pub struct ConnectionContext {
+    #[serde(flatten)]
+    pub rbac_ctx: ProxyRbacContext,
+    pub attributes: ConnectionAttributes,
+}
+
 impl ConnectionManager {
-    pub fn track_outbound(
-        &self,
-        src: SocketAddr,
-        original_dst: SocketAddr,
-        actual_dst: SocketAddr,
-        protocol: OutboundProtocol,
-    ) -> OutboundConnectionGuard {
-        let c = OutboundConnection {
-            src,
-            original_dst,
-            actual_dst,
-            protocol,
-        };
-
-        self.outbound_connections
-            .write()
-            .expect("mutex")
-            .insert(c.clone());
-
-        OutboundConnectionGuard {
-            cm: self.clone(),
-            conn: c,
-        }
-    }
-
     pub async fn assert_rbac(
         &self,
         state: &DemandProxyState,
-        ctx: &ProxyRbacContext,
-        dest_service: Option<String>,
+        ctx: ConnectionContext,
     ) -> Result<ConnectionGuard, Error> {
         // Register before our initial assert. This prevents a race if policy changes between assert() and
         // track()
-        let conn = InboundConnection {
-            ctx: ctx.clone(),
-            dest_service,
-        };
-        let Some(watch) = self.register(&conn) else {
-            warn!("failed to track {conn:?}");
-            debug_assert!(false, "failed to track {conn:?}");
+        let Some(watch) = self.register(&ctx) else {
+            warn!("failed to track {ctx:?}");
+            debug_assert!(false, "failed to track {ctx:?}");
             return Err(Error::ConnectionTrackingFailed);
         };
-        if let Err(err) = state.assert_rbac(ctx).await {
-            self.release(&conn);
+
+        if let Err(err) = state.assert_rbac(&ctx.rbac_ctx).await {
+            self.release(&ctx);
             return Err(Error::AuthorizationPolicyRejection(err));
         }
         Ok(ConnectionGuard {
             cm: self.clone(),
-            conn,
+            conn: ctx,
             watch: Some(watch),
         })
     }
@@ -211,7 +179,7 @@ impl ConnectionManager {
     // this must be done before a connection can be tracked
     // allows policy to be asserted against the connection
     // even no tasks have a receiver channel yet
-    fn register(&self, c: &InboundConnection) -> Option<DrainWatcher> {
+    fn register(&self, c: &ConnectionContext) -> Option<DrainWatcher> {
         match self.drains.write().expect("mutex").entry(c.clone()) {
             Entry::Occupied(mut cd) => {
                 cd.get_mut().count += 1;
@@ -229,7 +197,7 @@ impl ConnectionManager {
 
     // releases tracking on a connection
     // uses a counter to determine if there are other tracked connections or not so it may retain the tx/rx channels when necessary
-    pub fn release(&self, c: &InboundConnection) {
+    pub fn release(&self, c: &ConnectionContext) {
         let mut drains = self.drains.write().expect("mutex");
         if let Some((k, mut v)) = drains.remove_entry(c)
             && v.count > 1
@@ -240,12 +208,8 @@ impl ConnectionManager {
         }
     }
 
-    fn release_outbound(&self, c: &OutboundConnection) {
-        self.outbound_connections.write().expect("mutex").remove(c);
-    }
-
     // signal all connections listening to this channel to take action (typically terminate traffic)
-    async fn close(&self, c: &InboundConnection) {
+    async fn close(&self, c: &ConnectionContext) {
         let drain = { self.drains.write().expect("mutex").remove(c) };
         if let Some(cd) = drain {
             cd.drain().await;
@@ -256,7 +220,7 @@ impl ConnectionManager {
     }
 
     //  get a list of all connections being tracked
-    pub fn connections(&self) -> Vec<InboundConnection> {
+    pub fn connections(&self) -> Vec<ConnectionContext> {
         // potentially large copy under read lock, could require optimization
         self.drains.read().expect("mutex").keys().cloned().collect()
     }
@@ -264,8 +228,8 @@ impl ConnectionManager {
 
 #[derive(serde::Serialize)]
 struct ConnectionManagerDump {
-    inbound: Vec<InboundConnectionDump>,
-    outbound: Vec<OutboundConnection>,
+    inbound: Vec<ConnectionDump>,
+    outbound: Vec<ConnectionDump>,
 }
 
 impl Serialize for ConnectionManager {
@@ -279,23 +243,43 @@ impl Serialize for ConnectionManager {
             .expect("mutex")
             .keys()
             .cloned()
-            .map(|c| InboundConnectionDump {
-                src: c.ctx.conn.src,
-                original_dst: c.dest_service,
-                actual_dst: c.ctx.conn.dst,
-                protocol: if c.ctx.conn.src_identity.is_some() {
-                    InboundProtocol::HBONE
-                } else {
-                    InboundProtocol::TCP
-                },
+            .filter_map(|c| {
+                let ConnectionAttributes::Inbound(inbound_conn) = &c.attributes else {
+                    return None;
+                };
+                Some(ConnectionDump {
+                    src: c.rbac_ctx.conn.src,
+                    original_dst: inbound_conn.dest_service.clone(),
+                    actual_dst: c.rbac_ctx.conn.dst,
+                    protocol: if c.rbac_ctx.conn.src_identity.is_some() {
+                        InboundProtocol::HBONE
+                    } else {
+                        InboundProtocol::TCP
+                    },
+                })
             })
             .collect();
         let outbound: Vec<_> = self
-            .outbound_connections
+            .drains
             .read()
             .expect("mutex")
-            .iter()
+            .keys()
             .cloned()
+            .filter_map(|c| {
+                let ConnectionAttributes::Outbound(outbound_conn) = &c.attributes else {
+                    return None;
+                };
+                Some(ConnectionDump {
+                    src: c.rbac_ctx.conn.src,
+                    original_dst: Some(outbound_conn.actual_dst.to_string()),
+                    actual_dst: c.rbac_ctx.conn.dst,
+                    protocol: if c.rbac_ctx.conn.src_identity.is_some() {
+                        InboundProtocol::HBONE
+                    } else {
+                        InboundProtocol::TCP
+                    },
+                })
+            })
             .collect();
         let dump = ConnectionManagerDump { inbound, outbound };
         dump.serialize(serializer)
@@ -331,9 +315,9 @@ impl PolicyWatcher {
                 _ = policies_changed.changed() => {
                     let connections = self.connection_manager.connections();
                     for conn in connections {
-                        if self.state.assert_rbac(&conn.ctx).await.is_err() {
+                        if self.state.assert_rbac(&conn.rbac_ctx).await.is_err() {
                             self.connection_manager.close(&conn).await;
-                            info!("connection {} closed because it's no longer allowed after a policy update", conn.ctx);
+                            info!("connection {:?} closed because it's no longer allowed after a policy update", conn);
                         }
                     }
                 }
@@ -358,7 +342,10 @@ mod tests {
     use crate::xds::ProxyStateUpdateMutator;
     use crate::xds::istio::security::{Action, Authorization, Scope};
 
-    use super::{ConnectionGuard, ConnectionManager, InboundConnection, PolicyWatcher};
+    use super::{
+        ConnectionAttributes, ConnectionContext, ConnectionGuard, ConnectionManager,
+        InboundAttributes, PolicyWatcher,
+    };
 
     #[tokio::test]
     async fn test_connection_manager_close() {
@@ -368,7 +355,7 @@ mod tests {
         assert_eq!(cm.drains.read().unwrap().len(), 0);
         assert_eq!(cm.connections().len(), 0);
 
-        let register = |cm: &ConnectionManager, c: &InboundConnection| {
+        let register = |cm: &ConnectionManager, c: &ConnectionContext| {
             let cm = cm.clone();
             let c = c.clone();
 
@@ -381,8 +368,8 @@ mod tests {
         };
 
         // track a new connection
-        let rbac_ctx1 = InboundConnection {
-            ctx: crate::state::ProxyRbacContext {
+        let rbac_ctx1 = ConnectionContext {
+            rbac_ctx: crate::state::ProxyRbacContext {
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -394,10 +381,11 @@ mod tests {
                         Ipv4Addr::new(192, 168, 0, 2),
                         8080,
                     )),
+                    direction: crate::rbac::Direction::Inbound,
                 },
-                dest_workload: Arc::new(test_default_workload()),
+                workload: Arc::new(test_default_workload()),
             },
-            dest_service: None,
+            attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
         };
 
         // ensure drains contains exactly 1 item
@@ -415,8 +403,8 @@ mod tests {
         assert_eq!(cm.connections(), vec!(rbac_ctx1.clone()));
 
         // track a second connection
-        let rbac_ctx2 = InboundConnection {
-            ctx: crate::state::ProxyRbacContext {
+        let rbac_ctx2 = ConnectionContext {
+            rbac_ctx: crate::state::ProxyRbacContext {
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -428,10 +416,11 @@ mod tests {
                         Ipv4Addr::new(192, 168, 0, 2),
                         8080,
                     )),
+                    direction: crate::rbac::Direction::Inbound,
                 },
-                dest_workload: Arc::new(test_default_workload()),
+                workload: Arc::new(test_default_workload()),
             },
-            dest_service: None,
+            attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
         };
 
         let mut close2 = register(&cm, &rbac_ctx2);
@@ -440,7 +429,7 @@ mod tests {
         assert_eq!(cm.connections().len(), 2);
         let mut connections = cm.connections();
         // ordering cannot be guaranteed without sorting
-        connections.sort_by(|a, b| a.ctx.conn.cmp(&b.ctx.conn));
+        connections.sort_by(|a, b| a.rbac_ctx.conn.cmp(&b.rbac_ctx.conn));
         assert_eq!(connections, vec![rbac_ctx1.clone(), rbac_ctx2.clone()]);
 
         // spawn tasks to assert that we close in a timely manner for rbac_ctx1
@@ -470,7 +459,7 @@ mod tests {
         assert_eq!(cm.drains.read().unwrap().len(), 0);
         assert_eq!(cm.connections().len(), 0);
 
-        let register = |cm: &ConnectionManager, c: &InboundConnection| {
+        let register = |cm: &ConnectionManager, c: &ConnectionContext| {
             let cm = cm.clone();
             let c = c.clone();
 
@@ -483,8 +472,8 @@ mod tests {
         };
 
         // create a new connection
-        let conn1 = InboundConnection {
-            ctx: crate::state::ProxyRbacContext {
+        let conn1 = ConnectionContext {
+            rbac_ctx: crate::state::ProxyRbacContext {
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -496,15 +485,16 @@ mod tests {
                         Ipv4Addr::new(192, 168, 0, 2),
                         8080,
                     )),
+                    direction: crate::rbac::Direction::Inbound,
                 },
-                dest_workload: Arc::new(test_default_workload()),
+                workload: Arc::new(test_default_workload()),
             },
-            dest_service: None,
+            attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
         };
 
         // create a second connection
-        let conn2 = InboundConnection {
-            ctx: crate::state::ProxyRbacContext {
+        let conn2 = ConnectionContext {
+            rbac_ctx: crate::state::ProxyRbacContext {
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -516,10 +506,11 @@ mod tests {
                         Ipv4Addr::new(192, 168, 0, 2),
                         8080,
                     )),
+                    direction: crate::rbac::Direction::Inbound,
                 },
-                dest_workload: Arc::new(test_default_workload()),
+                workload: Arc::new(test_default_workload()),
             },
-            dest_service: None,
+            attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
         };
         let another_conn1 = conn1.clone();
 
@@ -544,7 +535,7 @@ mod tests {
         assert_eq!(cm.connections().len(), 2);
         let mut connections = cm.connections();
         // ordering cannot be guaranteed without sorting
-        connections.sort_by(|a, b| a.ctx.conn.cmp(&b.ctx.conn));
+        connections.sort_by(|a, b| a.rbac_ctx.conn.cmp(&b.rbac_ctx.conn));
         assert_eq!(connections, vec![conn1.clone(), conn2.clone()]);
 
         // release conn1
@@ -599,8 +590,8 @@ mod tests {
         });
 
         // create a test connection
-        let conn1 = InboundConnection {
-            ctx: crate::state::ProxyRbacContext {
+        let conn1 = ConnectionContext {
+            rbac_ctx: crate::state::ProxyRbacContext {
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -612,10 +603,11 @@ mod tests {
                         Ipv4Addr::new(192, 168, 0, 2),
                         8080,
                     )),
+                    direction: crate::rbac::Direction::Inbound,
                 },
-                dest_workload: Arc::new(test_default_workload()),
+                workload: Arc::new(test_default_workload()),
             },
-            dest_service: None,
+            attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
         };
         // watch the connection
         let close1 = connection_manager
@@ -632,6 +624,7 @@ mod tests {
             namespace: auth_namespace.into(),
             rules: vec![],
             dry_run: false,
+            auth_extensions: vec![],
         };
         let mut auth_xds_name = String::with_capacity(1 + auth_namespace.len() + auth_name.len());
         auth_xds_name.push_str(auth_namespace);

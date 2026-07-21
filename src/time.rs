@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +13,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
+
+use tokio::time::{Instant as TokioInstant, sleep_until};
+
+/// Generic debounce timer.
+///
+/// Tracks a "quiet" deadline that resets on every [`extend`](Self::extend)
+/// call and a hard "max" deadline that caps total wait time.  Embed in a
+/// `tokio::select!` loop: call `extend()` when new events arrive and
+/// `wait()` to sleep until the debounce period is over.
+pub struct Debouncer {
+    quiet_deadline: TokioInstant,
+    max_deadline: TokioInstant,
+    debounce_interval: Duration,
+}
+
+impl Debouncer {
+    pub fn new(debounce_interval: Duration, max_debounce_time: Duration) -> Self {
+        let now = TokioInstant::now();
+        Self {
+            quiet_deadline: now + debounce_interval,
+            max_deadline: now + max_debounce_time,
+            debounce_interval,
+        }
+    }
+
+    pub fn extend(&mut self) {
+        self.quiet_deadline = TokioInstant::now() + self.debounce_interval;
+    }
+
+    pub async fn wait(&self) {
+        let deadline = self.quiet_deadline.min(self.max_deadline);
+        sleep_until(deadline).await;
+    }
+}
 
 #[derive(Clone)]
 pub struct Converter {

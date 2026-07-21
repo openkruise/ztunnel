@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +23,8 @@ use std::{fmt, io};
 
 use hickory_proto::ProtoError;
 
+use crate::sandbox::sandbox::SandboxManager;
+use crate::socket::is_self_addr;
 use crate::strng::Strng;
 use rand::Rng;
 use socket2::TcpKeepalive;
@@ -36,6 +39,8 @@ use crate::identity::{Identity, SecretManager};
 
 use crate::dns::resolver::Resolver;
 use crate::drain::DrainWatcher;
+use crate::firewall::metrics::Metrics as FirewallMetrics;
+use crate::firewall::{FirewallController, detect_backend};
 use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
 use crate::proxy::inbound_passthrough::InboundPassthrough;
 use crate::proxy::outbound::Outbound;
@@ -169,6 +174,7 @@ pub struct Proxy {
     outbound: Outbound,
     socks5: Option<Socks5>,
     policy_watcher: PolicyWatcher,
+    firewall_controller: Option<FirewallController>,
 }
 
 pub struct LocalWorkloadInformation {
@@ -260,6 +266,8 @@ pub(super) struct ProxyInputs {
     // If true, inbound connections created with these inputs will not attempt to preserve the original source IP.
     pub disable_inbound_freebind: bool,
     pub(super) crl_manager: Option<Arc<tls::crl::CrlManager>>,
+    sandbox_manager: Option<Arc<SandboxManager>>,
+    firewall_metrics: Option<FirewallMetrics>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,6 +282,8 @@ impl ProxyInputs {
         local_workload_information: Arc<LocalWorkloadInformation>,
         disable_inbound_freebind: bool,
         crl_manager: Option<Arc<tls::crl::CrlManager>>,
+        sandbox_manager: Option<Arc<SandboxManager>>,
+        firewall_metrics: Option<FirewallMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
@@ -285,6 +295,8 @@ impl ProxyInputs {
             resolver,
             disable_inbound_freebind,
             crl_manager,
+            sandbox_manager,
+            firewall_metrics,
         })
     }
 }
@@ -318,8 +330,42 @@ impl Proxy {
         } else {
             None
         };
-        let policy_watcher =
-            PolicyWatcher::new(pi.state.clone(), drain, pi.connection_manager.clone());
+        let policy_watcher = PolicyWatcher::new(
+            pi.state.clone(),
+            drain.clone(),
+            pi.connection_manager.clone(),
+        );
+
+        let firewall_controller = if pi.cfg.sidecar_mode && pi.cfg.enable_firewall_rules {
+            let detected = match detect_backend(pi.cfg.firewall_backend, true) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "No configured netfilter backend detected ({}), using default iptables",
+                        e
+                    );
+                    crate::firewall::FirewallBackend::Iptables {
+                        iptables_bin: "iptables".to_string(),
+                        restore_bin: "iptables-restore".to_string(),
+                    }
+                }
+            };
+            let fw_metrics = pi
+                .firewall_metrics
+                .clone()
+                .expect("firewall_metrics must be provided when firewall is enabled");
+            Some(FirewallController::new_with_debounce(
+                pi.state.clone(),
+                drain,
+                detected,
+                pi.local_workload_information.workload_info(),
+                pi.cfg.firewall_debounce_interval,
+                pi.cfg.firewall_max_debounce_time,
+                fw_metrics,
+            ))
+        } else {
+            None
+        };
 
         Ok(Proxy {
             inbound,
@@ -327,6 +373,7 @@ impl Proxy {
             outbound,
             socks5,
             policy_watcher,
+            firewall_controller,
         })
     }
 
@@ -337,6 +384,10 @@ impl Proxy {
             tokio::spawn(self.inbound.run().in_current_span()),
             tokio::spawn(self.outbound.run().in_current_span()),
         ];
+
+        if let Some(fw) = self.firewall_controller {
+            tasks.push(tokio::spawn(fw.run().in_current_span()));
+        }
 
         if let Some(socks5) = self.socks5 {
             tasks.push(tokio::spawn(socks5.run().in_current_span()));
@@ -515,6 +566,10 @@ pub enum Error {
     DnsLookup(#[from] hickory_server::zone_handler::LookupError),
     #[error("dns response had no valid IP addresses")]
     DnsEmpty,
+    #[error("denied by egress policy, dest: {0}")]
+    EgressPolicyDenied(SocketAddr),
+    #[error("egress policy requires gateway but none configured")]
+    EgressPolicyGatewayMissing(SocketAddr),
 }
 
 // Custom TLV for proxy protocol for the identity of the source
@@ -667,7 +722,7 @@ pub async fn freebind_connect(
             }
             // TODO: Need figure out how to handle case of loadbalancing to itself.
             //       We use ztunnel addr instead, otherwise app side will be confused.
-            Some(src) if src == socket::to_canonical(addr).ip() => {
+            Some(src) if src == socket::to_canonical(addr).ip() && !is_self_addr(src) => {
                 let socket = create_socket(addr.is_ipv4())?;
                 trace!(%src, dest=%addr, "dest and source are the same, connect directly");
                 Ok(socket.connect(addr).await?)
@@ -675,14 +730,22 @@ pub async fn freebind_connect(
             Some(src) => {
                 let socket = create_socket(src.is_ipv4())?;
                 let local_addr = SocketAddr::new(src, 0);
-                match socket::set_freebind_and_transparent(&socket) {
-                    Err(err) => warn!("failed to set freebind: {:?}", err),
-                    _ => {
-                        if let Err(err) = socket.bind(local_addr) {
-                            warn!("failed to bind local addr: {:?}", err)
+
+                if !is_self_addr(src) {
+                    match socket::set_freebind_and_transparent(&socket) {
+                        Err(err) => warn!("failed to set freebind: {:?}", err),
+                        _ => {
+                            if let Err(err) = socket.bind(local_addr) {
+                                warn!("failed to bind local addr: {:?}", err)
+                            }
                         }
+                    };
+                } else {
+                    if let Err(err) = socket.bind(local_addr) {
+                        warn!("failed to bind local addr: {:?}", err)
                     }
-                };
+                }
+
                 trace!(%src, dest=%addr, "connect with source IP");
                 Ok(socket.connect(addr).await?)
             }

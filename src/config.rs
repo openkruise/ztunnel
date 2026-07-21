@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +30,7 @@ use hickory_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
 use hyper::Uri;
 use hyper::http::uri::InvalidUri;
 
+use crate::probe;
 use crate::strng::Strng;
 use crate::{identity, state};
 #[cfg(any(test, feature = "testing"))]
@@ -72,6 +74,11 @@ const TERMINATION_GRACE_PERIOD_SECONDS: &str = "TERMINATION_GRACE_PERIOD_SECONDS
 const ENABLE_ORIG_SRC: &str = "ENABLE_ORIG_SRC";
 const PROXY_CONFIG: &str = "PROXY_CONFIG";
 const IPV6_ENABLED: &str = "IPV6_ENABLED";
+const FIREWALL_BACKEND: &str = "FIREWALL_BACKEND";
+const FIREWALL_DEBOUNCE_INTERVAL: &str = "FIREWALL_DEBOUNCE_INTERVAL";
+const FIREWALL_MAX_DEBOUNCE_TIME: &str = "FIREWALL_MAX_DEBOUNCE_TIME";
+const ENABLE_SANDBOX_MANAGER: &str = "ENABLE_SANDBOX_MANAGER";
+const SANDBOX_TOKEN_PATH: &str = "SANDBOX_TOKEN_PATH";
 
 const HTTP2_STREAM_WINDOW_SIZE: &str = "HTTP2_STREAM_WINDOW_SIZE";
 const HTTP2_CONNECTION_WINDOW_SIZE: &str = "HTTP2_CONNECTION_WINDOW_SIZE";
@@ -92,6 +99,7 @@ const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
 const DEFAULT_POOL_UNUSED_RELEASE_TIMEOUT: Duration = Duration::from_secs(60 * 5); // 5 minutes
 const DEFAULT_POOL_MAX_STREAMS_PER_CONNECTION: u16 = 100; //Go: 100, Hyper: 200, Envoy: 2147483647 (lol), Spec recommended minimum 100
+const DEFAULT_SANDBOX_TOKEN_PATH: &str = "/var/opt/sandbox/agent-token/";
 
 const DEFAULT_INPOD_MARK: u32 = 1337;
 
@@ -149,6 +157,30 @@ pub enum ProxyMode {
     #[default]
     Shared,
     Dedicated,
+}
+
+#[derive(serde::Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FirewallBackendMode {
+    #[default]
+    Auto,
+    Iptables,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid firewall backend '{0}', expected 'auto' or 'iptables'")]
+pub struct FirewallBackendModeParseError(String);
+
+impl FromStr for FirewallBackendMode {
+    type Err = FirewallBackendModeParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "iptables" => Ok(Self::Iptables),
+            _ => Err(FirewallBackendModeParseError(s.to_string())),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +355,26 @@ pub struct Config {
     // path to CRL file; if set, enables CRL checking
     pub crl_path: Option<PathBuf>,
     pub enable_enhanced_baggage: bool,
+
+    pub sidecar_mode: bool,
+
+    pub kube_app_probes: Option<HashMap<String, probe::Prober>>,
+
+    pub probe_keepalive_connections: bool,
+
+    pub pod_ip: String,
+
+    pub enable_firewall_rules: bool,
+
+    pub firewall_backend: FirewallBackendMode,
+
+    pub firewall_debounce_interval: Duration,
+
+    pub firewall_max_debounce_time: Duration,
+
+    pub enable_sandbox_manager: bool,
+
+    pub sandbox_token_path: String,
 }
 
 #[derive(serde::Serialize, Clone, Copy, Debug)]
@@ -656,23 +708,40 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         None => ProxyMode::Shared,
     };
     let proxy_workload_information = if proxy_mode != ProxyMode::Shared {
-        let Some(raw) = parse::<String>(PROXY_WORKLOAD_INFO)? else {
-            // TODO: in the future, we can provide a mode where we automatically detect based on IP address.
-            return Err(Error::InvalidState(format!(
-                "{PROXY_MODE}={PROXY_MODE_DEDICATED} requires {PROXY_WORKLOAD_INFO} to be set"
-            )));
+        let info = if let Some(raw) = parse::<String>(PROXY_WORKLOAD_INFO)? {
+            let parts: Vec<&str> = raw.split('/').collect();
+            match parts.as_slice() {
+                [ns, name, sa] => state::WorkloadInfo {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    service_account: sa.to_string(),
+                },
+                _ => {
+                    return Err(Error::InvalidState(format!(
+                        "{PROXY_WORKLOAD_INFO} must match 'namespace/name/service-account' (got '{raw}')"
+                    )));
+                }
+            }
+        } else {
+            match (
+                parse::<String>("POD_NAMESPACE")?,
+                parse::<String>("POD_NAME")?,
+                parse::<String>("SERVICE_ACCOUNT")?,
+            ) {
+                (Some(namespace), Some(name), Some(service_account)) => state::WorkloadInfo {
+                    namespace,
+                    name,
+                    service_account,
+                },
+                _ => {
+                    return Err(Error::InvalidState(format!(
+                        "{proxy_mode:?} mode requires either {PROXY_WORKLOAD_INFO} or \
+                    (POD_NAMESPACE, POD_NAME, SERVICE_ACCOUNT) to be set"
+                    )));
+                }
+            }
         };
-        let s: Vec<&str> = raw.splitn(3, "/").collect();
-        let &[ns, name, sa] = &s[..] else {
-            return Err(Error::InvalidState(format!(
-                "{PROXY_WORKLOAD_INFO} must match the format 'namespace/name/service-account' (got {s:?})"
-            )));
-        };
-        Some(state::WorkloadInfo {
-            name: name.to_string(),
-            namespace: ns.to_string(),
-            service_account: sa.to_string(),
-        })
+        Some(info)
     } else {
         None
     };
@@ -714,6 +783,14 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             (Some(identity), Some(workload))
         }
         _ => (None, None),
+    };
+
+    let probers = match parse::<String>("ISTIO_KUBE_APP_PROBERS") {
+        Ok(probers_config) => match probers_config {
+            Some(config) => serde_json::from_str::<HashMap<String, probe::Prober>>(&config).ok(),
+            None => None,
+        },
+        _ => None,
     };
 
     validate_config(Config {
@@ -885,6 +962,25 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from),
         enable_enhanced_baggage: parse_default(ENABLE_ENHANCED_BAGGAGE, true)?,
+        sidecar_mode: parse_default::<bool>("ENABLE_SIDECAR_MODE", false)?,
+        enable_firewall_rules: parse_default::<bool>("ENABLE_FIREWALL_RULES", false)?,
+        firewall_backend: parse_default(FIREWALL_BACKEND, FirewallBackendMode::Auto)?,
+        firewall_debounce_interval: parse_duration_default(
+            FIREWALL_DEBOUNCE_INTERVAL,
+            crate::firewall::DEFAULT_FIREWALL_DEBOUNCE_INTERVAL,
+        )?,
+        firewall_max_debounce_time: parse_duration_default(
+            FIREWALL_MAX_DEBOUNCE_TIME,
+            crate::firewall::DEFAULT_FIREWALL_MAX_DEBOUNCE_TIME,
+        )?,
+        enable_sandbox_manager: env::var(ENABLE_SANDBOX_MANAGER)
+            .map(|value| value == "true")
+            .unwrap_or(false),
+        sandbox_token_path: env::var(SANDBOX_TOKEN_PATH)
+            .unwrap_or_else(|_| DEFAULT_SANDBOX_TOKEN_PATH.to_string()),
+        kube_app_probes: probers,
+        probe_keepalive_connections: parse_default("ENABLE_PROBE_KEEPALIVE_CONNECTIONS", false)?,
+        pod_ip: parse_default("INSTANCE_IP", "127.0.0.1".to_string())?,
     })
 }
 
@@ -1089,6 +1185,31 @@ impl Address {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn parses_firewall_backend_mode() {
+        assert_eq!(FirewallBackendMode::default(), FirewallBackendMode::Auto);
+        assert_eq!(
+            "auto".parse::<FirewallBackendMode>().unwrap(),
+            FirewallBackendMode::Auto
+        );
+        assert_eq!(
+            "iptables".parse::<FirewallBackendMode>().unwrap(),
+            FirewallBackendMode::Iptables
+        );
+        assert!("nft".parse::<FirewallBackendMode>().is_err());
+
+        unsafe {
+            env::set_var(FIREWALL_BACKEND, "iptables");
+        }
+        assert_eq!(
+            parse_default(FIREWALL_BACKEND, FirewallBackendMode::Auto).unwrap(),
+            FirewallBackendMode::Iptables
+        );
+        unsafe {
+            env::remove_var(FIREWALL_BACKEND);
+        }
+    }
 
     #[test]
     fn config_from_proxyconfig() {

@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -389,7 +390,7 @@ pub fn rbac(c: &mut Criterion) {
             src_identity: None,
             dst_network: "".into(),
         },
-        dest_workload: Arc::new(test_default_workload()),
+        workload: Arc::new(test_default_workload()),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

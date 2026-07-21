@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +25,11 @@ use tokio::sync::watch;
 
 use tracing::{Instrument, debug, error, info, info_span, trace_span};
 
+use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
 use crate::identity::Identity;
+use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
+use crate::rbac::{Connection, Direction};
+use crate::sandbox::sandbox;
 use crate::strng::Strng;
 
 use crate::proxy::metrics::Reporter;
@@ -41,8 +46,9 @@ use crate::proxy::h2::{H2Stream, client::WorkloadKey};
 use crate::state::service::{LoadBalancerMode, Service, ServiceDescription};
 use crate::state::workload::OutboundProtocol;
 use crate::state::workload::{InboundProtocol, NetworkAddress, Workload, address::Address};
-use crate::state::{ServiceResolutionMode, Upstream};
+use crate::state::{ProxyRbacContext, ServiceResolutionMode, Upstream};
 use crate::tls::identity_from_connection;
+use crate::xds::kruise::networking::extensions::v1::MeshInternalTrafficPolicy::MeshInternalPassthrough;
 use crate::{assertions, copy, proxy, socket};
 
 use super::h2::TokioH2Stream;
@@ -192,13 +198,45 @@ impl OutboundConnection {
                 return;
             }
         };
+
+        let rbac_ctx = ProxyRbacContext {
+            conn: Connection {
+                src: source_addr,
+                dst: dest_addr,
+                src_identity: Some(req.source.identity()),
+                dst_network: req
+                    .actual_destination_workload
+                    .clone()
+                    .map(|x| x.network.clone())
+                    .unwrap_or("".into()),
+                direction: Direction::Outbound,
+            },
+            workload: req.source.clone(),
+        };
+        let conn = ConnectionAttributes::Outbound(proxy::connection_manager::OutboundAttributes {
+            actual_dst: req.actual_destination,
+            protocol: req.protocol,
+        });
+
         // TODO: should we use the original address or the actual address? Both seems nice!
-        let _conn_guard = self.pi.connection_manager.track_outbound(
-            source_addr,
-            dest_addr,
-            req.actual_destination,
-            req.protocol,
-        );
+        let mut conn_guard = match self
+            .pi
+            .connection_manager
+            .assert_rbac(
+                &self.pi.state,
+                ConnectionContext {
+                    rbac_ctx,
+                    attributes: conn,
+                },
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                metrics::log_early_deny(source_addr, dest_addr, Reporter::source, err);
+                return;
+            }
+        };
 
         let metrics = self.pi.metrics.clone();
         let hbone_target = req.hbone_target_destination.clone();
@@ -211,26 +249,38 @@ impl OutboundConnection {
             metrics,
         ));
 
-        match req.protocol {
-            OutboundProtocol::DOUBLEHBONE => {
-                // We box this since its not a common path and it would make the future really big.
-                Box::pin(self.proxy_to_double_hbone(
-                    source_stream,
-                    source_addr,
-                    &req,
-                    connection_result_builder,
-                ))
-                .await
-            }
-            OutboundProtocol::HBONE => {
-                self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
+        let drain_watch = conn_guard.watcher();
+        let proxy_future = async {
+            match req.protocol {
+                OutboundProtocol::DOUBLEHBONE => {
+                    // We box this since its not a common path and it would make the future really big.
+                    Box::pin(self.proxy_to_double_hbone(
+                        source_stream,
+                        source_addr,
+                        &req,
+                        connection_result_builder,
+                    ))
                     .await
-            }
-            OutboundProtocol::TCP => {
-                self.proxy_to_tcp(source_stream, &req, connection_result_builder)
-                    .await
+                }
+                OutboundProtocol::HBONE => {
+                    self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
+                        .await
+                }
+                OutboundProtocol::TCP => {
+                    self.proxy_to_tcp(source_stream, &req, connection_result_builder)
+                        .await
+                }
             }
         };
+
+        tokio::select! {
+            _ = proxy_future => {
+                conn_guard.release();
+            }
+            _ = drain_watch.wait_for_drain() => {
+                debug!("outbound connection terminated due to policy change");
+            }
+        }
     }
 
     async fn proxy_to_double_hbone(
@@ -363,6 +413,18 @@ impl OutboundConnection {
         // Add x-istio-origin-network header for inner CONNECT requests in double HBONE
         if let Some(network) = origin_network {
             builder = builder.header(X_FORWARDED_NETWORK_HEADER, network.as_str());
+        }
+
+        if let Some(sandbox_manager) = &self.pi.sandbox_manager {
+            if let Some(token) = sandbox_manager.list_sandbox_tokens().first() {
+                builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
+            }
+            // if let Some(sandbox_id) = sandbox_manager.get_sandbox_id() {
+            //     builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox_id.as_str());
+            // }
+            if let Some(encoded_labels) = &req.source.encoded_labels {
+                builder = builder.header(sandbox::SANDBOX_LABELS_HEADER, encoded_labels.as_str());
+            }
         }
 
         builder
@@ -531,6 +593,24 @@ impl OutboundConnection {
     ) -> Result<Request, Error> {
         let state = &self.pi.state;
 
+        if source_workload.mesh_internal_traffic_policy == MeshInternalPassthrough {
+            if let Some(result) = self.apply_egress_policy(&source_workload, &target).await {
+                return result;
+            }
+
+            debug!("built request as passthrough;");
+            return Ok(Request {
+                protocol: OutboundProtocol::TCP,
+                source: source_workload,
+                hbone_target_destination: None,
+                actual_destination_workload: None,
+                intended_destination_service: None,
+                actual_destination: target,
+                upstream_sans: vec![],
+                final_sans: vec![],
+            });
+        }
+
         // If this is to-service traffic check for a service waypoint
         // Capture result of whether this is svc addressed
         let service = if let Some(Address::Service(target_service)) = state
@@ -603,6 +683,11 @@ impl OutboundConnection {
             {
                 return Err(Error::NoHealthyUpstream(target));
             }
+
+            if let Some(result) = self.apply_egress_policy(&source_workload, &target).await {
+                return result;
+            }
+
             debug!("built request as passthrough; no upstream found");
             return Ok(Request {
                 protocol: OutboundProtocol::TCP,
@@ -715,6 +800,89 @@ impl OutboundConnection {
             final_sans,
         })
     }
+
+    async fn apply_egress_policy(
+        &self,
+        source_workload: &Arc<Workload>,
+        target: &SocketAddr,
+    ) -> Option<Result<Request, Error>> {
+        // Prefer the independent xDS workload extension store; fall back to
+        // workload-embedded policies when the store is empty (backward compat).
+        //
+        // Match inside the read lock to avoid cloning all extensions per connection.
+        // Only the matched action + gateway (if any) are extracted.
+        let matched = {
+            let state = self.pi.state.read();
+            let ns = state
+                .workload_configs
+                .get_by_namespace(&source_workload.namespace);
+            let global = state
+                .workload_configs
+                .get_by_namespace(&crate::strng::EMPTY);
+            if ns.is_empty() && global.is_empty() {
+                match_egress_policy(
+                    source_workload.egress_policies.as_ref()?,
+                    source_workload.namespace.as_ref(),
+                    target,
+                )
+                .map(|p| (p.policy, p.gateway.clone()))
+            } else {
+                ns.into_iter()
+                    .chain(global)
+                    .find_map(|ext| {
+                        match_egress_policy(
+                            &ext.egress_policies,
+                            source_workload.namespace.as_ref(),
+                            target,
+                        )
+                    })
+                    .map(|p| (p.policy, p.gateway.clone()))
+            }
+        };
+        let (action, gateway) = matched?;
+        match action {
+            EgressPolicyAction::Passthrough => {
+                debug!("egress policy matched passthrough for target {target}");
+                None
+            }
+            EgressPolicyAction::Deny => Some(Err(Error::EgressPolicyDenied(*target))),
+            EgressPolicyAction::Gateway => {
+                debug!("egress policy matched gateway action for target {target}");
+                let gw_address = match gateway.as_ref() {
+                    Some(gw) => gw,
+                    None => return Some(Err(Error::EgressPolicyGatewayMissing(*target))),
+                };
+                let waypoint = match self
+                    .pi
+                    .state
+                    .fetch_waypoint(gw_address, source_workload, *target)
+                    .await
+                {
+                    Ok(w) => w,
+                    Err(e) => return Some(Err(e)),
+                };
+                let actual_destination = match waypoint.workload_socket_addr() {
+                    Some(addr) => addr,
+                    None => {
+                        return Some(Err(Error::NoValidDestination(Box::new(
+                            (*waypoint.workload).clone(),
+                        ))));
+                    }
+                };
+                let upstream_sans = waypoint.workload_and_services_san();
+                Some(Ok(Request {
+                    protocol: OutboundProtocol::HBONE,
+                    source: source_workload.clone(),
+                    hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
+                    actual_destination_workload: Some(waypoint.workload),
+                    intended_destination_service: None,
+                    actual_destination,
+                    upstream_sans,
+                    final_sans: vec![],
+                }))
+            }
+        }
+    }
 }
 
 fn build_forwarded(remote_addr: SocketAddr, server: &Option<ServiceDescription>) -> String {
@@ -760,6 +928,39 @@ struct Request {
     // This field only matters if we need to know both the identity of the next hop, as well as the
     // final hop (currently, this is only double HBONE).
     final_sans: Vec<Identity>,
+}
+
+/// Find the first egress policy that applies to a connection from
+/// `source_namespace` going to `target`. Returns `None` when no policy passes
+/// all of the namespace / CIDR / port filters.
+///
+/// Match rules (an empty list means "match anything"):
+/// - `policy.namespaces` is empty OR contains `source_namespace`
+/// - `policy.match_cidrs` is empty OR some CIDR contains `target.ip()`
+/// - `policy.match_ports` is empty OR some port equals `target.port()`
+///
+/// First-match-wins: iteration order in `policies.policies` is the priority
+/// order, and later policies are not consulted once a candidate is found.
+pub(crate) fn match_egress_policy<'a>(
+    policies: &'a EgressPolicies,
+    source_namespace: &str,
+    target: &SocketAddr,
+) -> Option<&'a EgressPolicy> {
+    policies.policies.iter().find(|policy| {
+        let ns_ok = policy.namespaces.is_empty() || policy.namespaces.contains(source_namespace);
+        if !ns_ok {
+            return false;
+        }
+        let cidr_ok = policy.match_cidrs.is_empty()
+            || policy
+                .match_cidrs
+                .iter()
+                .any(|cidr| cidr.contains(&target.ip()));
+        if !cidr_ok {
+            return false;
+        }
+        policy.match_ports.is_empty() || policy.match_ports.iter().any(|p| *p == target.port())
+    })
 }
 
 #[cfg(test)]
@@ -870,6 +1071,8 @@ mod tests {
                 resolver: None,
                 disable_inbound_freebind: false,
                 crl_manager: None,
+                sandbox_manager: None,
+                firewall_metrics: None,
             }),
             id: TraceParent::new(),
             pool: WorkloadHBONEPool::new(
@@ -1977,6 +2180,8 @@ mod tests {
                 resolver: None,
                 disable_inbound_freebind: false,
                 crl_manager: None,
+                sandbox_manager: None,
+                firewall_metrics: None,
             }),
             id: TraceParent::new(),
             pool: WorkloadHBONEPool::new(
@@ -2040,5 +2245,195 @@ mod tests {
         protocol: OutboundProtocol,
         hbone_destination: &'a str,
         destination: &'a str,
+    }
+
+    mod match_egress_policy_tests {
+        use super::super::match_egress_policy;
+        use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
+        use ipnet::IpNet;
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+
+        fn target(addr: &str) -> SocketAddr {
+            addr.parse().expect("valid SocketAddr")
+        }
+
+        fn cidr(s: &str) -> IpNet {
+            s.parse().expect("valid CIDR")
+        }
+
+        fn ns(items: &[&str]) -> HashSet<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        }
+
+        fn policy_passthrough() -> EgressPolicy {
+            EgressPolicy {
+                namespaces: HashSet::new(),
+                match_cidrs: vec![],
+                match_ports: vec![],
+                policy: EgressPolicyAction::Passthrough,
+                gateway: None,
+            }
+        }
+
+        fn wrap(policies: Vec<EgressPolicy>) -> EgressPolicies {
+            EgressPolicies { policies }
+        }
+
+        #[test]
+        fn empty_policy_list_returns_none() {
+            // Defensive baseline: callers wrap this in `if let Some(policies)`, but
+            // an empty `policies` field must also short-circuit to None.
+            let ep = wrap(vec![]);
+            assert!(match_egress_policy(&ep, "ns1", &target("10.0.0.1:80")).is_none());
+        }
+
+        #[test]
+        fn fully_unconstrained_policy_matches_anything() {
+            let ep = wrap(vec![policy_passthrough()]);
+            let got =
+                match_egress_policy(&ep, "any-ns", &target("1.2.3.4:9999")).expect("should match");
+            assert_eq!(got.policy, EgressPolicyAction::Passthrough);
+        }
+
+        #[test]
+        fn namespace_filter_admits_listed_source() {
+            let ep = wrap(vec![EgressPolicy {
+                namespaces: ns(&["ns-a", "ns-b"]),
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns-a", &target("10.0.0.1:80")).is_some());
+            assert!(match_egress_policy(&ep, "ns-b", &target("10.0.0.1:80")).is_some());
+        }
+
+        #[test]
+        fn namespace_filter_rejects_unlisted_source() {
+            let ep = wrap(vec![EgressPolicy {
+                namespaces: ns(&["ns-a"]),
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns-other", &target("10.0.0.1:80")).is_none());
+        }
+
+        #[test]
+        fn cidr_filter_admits_target_inside_any_range() {
+            let ep = wrap(vec![EgressPolicy {
+                match_cidrs: vec![cidr("10.0.0.0/8"), cidr("192.168.1.0/24")],
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns", &target("10.255.255.1:80")).is_some());
+            assert!(match_egress_policy(&ep, "ns", &target("192.168.1.42:80")).is_some());
+        }
+
+        #[test]
+        fn cidr_filter_rejects_target_outside_all_ranges() {
+            let ep = wrap(vec![EgressPolicy {
+                match_cidrs: vec![cidr("10.0.0.0/8")],
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns", &target("172.16.0.1:80")).is_none());
+        }
+
+        #[test]
+        fn port_filter_admits_target_with_matching_port() {
+            let ep = wrap(vec![EgressPolicy {
+                match_ports: vec![80, 443, 8080],
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns", &target("10.0.0.1:443")).is_some());
+            assert!(match_egress_policy(&ep, "ns", &target("10.0.0.1:8080")).is_some());
+        }
+
+        #[test]
+        fn port_filter_rejects_target_with_non_matching_port() {
+            let ep = wrap(vec![EgressPolicy {
+                match_ports: vec![80, 443],
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns", &target("10.0.0.1:22")).is_none());
+        }
+
+        #[test]
+        fn combined_filters_require_all_to_pass() {
+            // ns-a + 10.0.0.0/24 + port 80 — only the exact triple matches.
+            let ep = wrap(vec![EgressPolicy {
+                namespaces: ns(&["ns-a"]),
+                match_cidrs: vec![cidr("10.0.0.0/24")],
+                match_ports: vec![80],
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns-a", &target("10.0.0.5:80")).is_some());
+            // wrong namespace
+            assert!(match_egress_policy(&ep, "ns-b", &target("10.0.0.5:80")).is_none());
+            // wrong CIDR
+            assert!(match_egress_policy(&ep, "ns-a", &target("11.0.0.5:80")).is_none());
+            // wrong port
+            assert!(match_egress_policy(&ep, "ns-a", &target("10.0.0.5:81")).is_none());
+        }
+
+        #[test]
+        fn first_match_wins_skips_later_policies() {
+            // A passthrough policy ahead of a deny policy must shadow the deny —
+            // proves order-priority semantics that the caller relies on for
+            // "allow-list before deny-all" configs.
+            let allow_first = EgressPolicy {
+                match_cidrs: vec![cidr("10.0.0.0/24")],
+                policy: EgressPolicyAction::Passthrough,
+                ..policy_passthrough()
+            };
+            let deny_all = EgressPolicy {
+                policy: EgressPolicyAction::Deny,
+                ..policy_passthrough()
+            };
+            let ep = wrap(vec![allow_first, deny_all]);
+            let got = match_egress_policy(&ep, "ns", &target("10.0.0.5:80"))
+                .expect("first policy should match");
+            assert_eq!(got.policy, EgressPolicyAction::Passthrough);
+        }
+
+        #[test]
+        fn non_matching_policy_falls_through_to_next() {
+            // The first policy filters out by CIDR; the second has no filters
+            // and should be returned.
+            let strict_first = EgressPolicy {
+                match_cidrs: vec![cidr("10.0.0.0/24")],
+                policy: EgressPolicyAction::Deny,
+                ..policy_passthrough()
+            };
+            let catchall = EgressPolicy {
+                policy: EgressPolicyAction::Gateway,
+                ..policy_passthrough()
+            };
+            let ep = wrap(vec![strict_first, catchall]);
+            let got = match_egress_policy(&ep, "ns", &target("172.16.0.1:80"))
+                .expect("catchall should match");
+            assert_eq!(got.policy, EgressPolicyAction::Gateway);
+        }
+
+        #[test]
+        fn ipv6_target_matches_ipv6_cidr() {
+            // CIDR matching has to work for IPv6 too — production traffic on
+            // dual-stack hosts will hit this branch.
+            let ep = wrap(vec![EgressPolicy {
+                match_cidrs: vec![cidr("fd00::/8")],
+                ..policy_passthrough()
+            }]);
+            assert!(match_egress_policy(&ep, "ns", &target("[fd00::1]:80")).is_some());
+            assert!(match_egress_policy(&ep, "ns", &target("[2001:db8::1]:80")).is_none());
+        }
+
+        #[test]
+        fn returned_reference_preserves_action_and_gateway() {
+            // The caller dispatches on `policy.policy` and reads `policy.gateway`
+            // for the Gateway branch — verify we don't accidentally lose them.
+            let ep = wrap(vec![EgressPolicy {
+                policy: EgressPolicyAction::Gateway,
+                gateway: None, // gateway resolution is the caller's responsibility
+                ..policy_passthrough()
+            }]);
+            let got = match_egress_policy(&ep, "ns", &target("10.0.0.1:80")).expect("match");
+            assert_eq!(got.policy, EgressPolicyAction::Gateway);
+            assert!(got.gateway.is_none());
+        }
     }
 }
