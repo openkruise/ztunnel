@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +15,7 @@
 
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
-use crate::rbac::Authorization;
+use crate::rbac::{Authorization, Direction, RbacDecision};
 use crate::state::policy::PolicyStore;
 use crate::state::service::{
     Endpoint, IpFamily, LoadBalancerMode, LoadBalancerScopes, ServiceStore,
@@ -24,8 +25,10 @@ use crate::state::workload::{
     GatewayAddress, NamespacedHostname, NetworkAddress, Workload, WorkloadStore, address::Address,
     gatewayaddress::Destination, network_addr,
 };
+use crate::state::workload_config::{WorkloadConfigData, WorkloadConfigStore};
 use crate::strng::Strng;
 use crate::tls;
+use crate::xds::XdsWorkloadConfig;
 use crate::xds::istio::security::Authorization as XdsAuthorization;
 use crate::xds::istio::workload::Address as XdsAddress;
 use crate::xds::{AdsClient, Demander, LocalClient, ProxyStateUpdater};
@@ -49,12 +52,14 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
+use xds::kruise::networking::extensions::v1::TrafficPolicyMode;
 
 use self::workload::ApplicationTunnel;
 
 pub mod policy;
 pub mod service;
 pub mod workload;
+pub mod workload_config;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Upstream {
@@ -155,7 +160,7 @@ impl WorkloadInfo {
 pub struct ProxyRbacContext {
     pub conn: rbac::Connection,
     #[educe(Hash(ignore), PartialEq(ignore))]
-    pub dest_workload: Arc<Workload>,
+    pub workload: Arc<Workload>,
 }
 
 impl ProxyRbacContext {
@@ -166,7 +171,7 @@ impl ProxyRbacContext {
 
 impl fmt::Display for ProxyRbacContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.conn, self.dest_workload.uid)?;
+        write!(f, "{} ({})", self.conn, self.workload)?;
         Ok(())
     }
 }
@@ -178,6 +183,8 @@ pub struct ProxyState {
     pub services: ServiceStore,
 
     pub policies: PolicyStore,
+
+    pub workload_configs: WorkloadConfigStore,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -186,6 +193,7 @@ struct ProxyStateSerialization<'a> {
     workloads: Vec<Arc<Workload>>,
     services: Vec<Arc<Service>>,
     policies: Vec<Authorization>,
+    workload_configs: Vec<(&'a Strng, &'a WorkloadConfigData)>,
     staged_services: &'a HashMap<NamespacedHostname, HashMap<Strng, Endpoint>>,
 }
 
@@ -220,10 +228,17 @@ impl serde::Serialize for ProxyState {
             .map(|k| k.1)
             .cloned()
             .collect();
+        let workload_configs: Vec<_> = self
+            .workload_configs
+            .all()
+            .iter()
+            .sorted_by_key(|k| k.0)
+            .collect();
         let serializable = ProxyStateSerialization {
             workloads,
             services,
             policies,
+            workload_configs,
             staged_services: &self.services.staged_services,
         };
         serializable.serialize(serializer)
@@ -236,6 +251,7 @@ impl ProxyState {
             workloads: WorkloadStore::new(local_node),
             services: Default::default(),
             policies: Default::default(),
+            workload_configs: Default::default(),
         }
     }
 
@@ -541,7 +557,7 @@ impl DemandProxyState {
         &self,
         ctx: &ProxyRbacContext,
     ) -> Result<(), proxy::AuthorizationRejectionError> {
-        let wl = &ctx.dest_workload;
+        let wl = ctx.workload.clone();
         let conn = &ctx.conn;
         let state = self.read();
 
@@ -550,20 +566,64 @@ impl DemandProxyState {
         let global = state.policies.get_by_namespace(&crate::strng::EMPTY);
         let workload = wl.authorization_policies.iter();
 
-        // Aggregate all of them based on type
-        let (all_allow, all_deny): (Vec<_>, Vec<_>) = ns
+        // Aggregate all policies
+        let all_policies: Vec<&Authorization> = ns
             .iter()
             .chain(global.iter())
             .chain(workload)
             .filter_map(|k| {
-                let pol = state.policies.get(k);
-                // Policy not found. This is probably transition state where the policy hasn't been sent
-                // by the control plane, or it was just removed.
-                if pol.is_none() {
-                    warn!("skipping unknown policy {k}");
-                }
-                pol
+                let pol = state.policies.get(k)?;
+                // Filter by direction: inbound skips server-mode, outbound skips client-mode
+                let skip = match (ctx.conn.direction, pol.mode) {
+                    (Direction::Inbound, TrafficPolicyMode::Client) => true,
+                    (Direction::Outbound, TrafficPolicyMode::Server) => true,
+                    _ => false,
+                };
+                if skip { None } else { Some(pol) }
             })
+            .collect();
+
+        // Split into priority and non-priority policies
+        let (mut priority_policies, non_priority_policies): (Vec<_>, Vec<_>) =
+            all_policies.into_iter().partition(|p| p.priority.is_some());
+        // Sort priority policies by priority ascending (lower priority first)
+        priority_policies.sort_by_key(|p| p.priority);
+
+        for pol in priority_policies.iter() {
+            debug!(policy = pol.to_key().as_str(), "traffic policy matching");
+            match pol.match_with_decision(conn) {
+                RbacDecision::Allow => {
+                    debug!(
+                        policy = pol.to_key().as_str(),
+                        "traffic policy match allowed"
+                    );
+                    return Ok(());
+                }
+                RbacDecision::Deny => {
+                    debug!(
+                        policy = pol.to_key().as_str(),
+                        "traffic policy match denied"
+                    );
+                    return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                        pol.namespace.to_owned(),
+                        pol.name.to_owned(),
+                    ));
+                }
+                RbacDecision::NoMatch => {
+                    continue;
+                }
+            }
+        }
+        if !priority_policies.is_empty() {
+            return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                "".into(),
+                "DEFAULT-DENY".into(),
+            ));
+        }
+
+        // Second round: no priority policy matched, fall back to non-priority policies
+        let (all_allow, all_deny): (Vec<_>, Vec<_>) = non_priority_policies
+            .into_iter()
             .partition(|p| p.action == rbac::RbacAction::Allow);
 
         let (deny, deny_dry_run): (Vec<&Authorization>, Vec<&Authorization>) =
@@ -911,7 +971,7 @@ impl DemandProxyState {
             })
     }
 
-    async fn fetch_waypoint(
+    pub async fn fetch_waypoint(
         &self,
         gw_address: &GatewayAddress,
         source_workload: &Workload,
@@ -1097,7 +1157,14 @@ impl ProxyStateManager {
             Some(
                 xds::Config::new(config.clone(), tls_client_fetcher)
                     .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
-                    .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater)
+                    .with_watched_handler::<XdsAuthorization>(
+                        xds::AUTHORIZATION_TYPE,
+                        updater.clone(),
+                    )
+                    .with_optional_watched_handler::<XdsWorkloadConfig>(
+                        xds::WORKLOAD_CONFIG_TYPE,
+                        updater,
+                    )
                     .build(xds_metrics, awaiting_ready),
             )
         } else {
@@ -1455,8 +1522,9 @@ mod tests {
                 )),
                 dst_network: "".into(),
                 dst: SocketAddr::new(workload.workload_ips[0], 8080),
+                direction: rbac::Direction::Inbound,
             },
-            dest_workload: get_workload(state, dest_uid),
+            workload: get_workload(state, dest_uid),
         }
     }
     fn create_state(state: ProxyState) -> DemandProxyState {
@@ -1479,6 +1547,7 @@ mod tests {
             rules: vec![vec![]],
             scope: rbac::RbacScope::Namespace,
             dry_run: true,
+            ..Default::default()
         }
     }
 
@@ -1523,6 +1592,7 @@ mod tests {
                 ],
                 scope: rbac::RbacScope::Namespace,
                 dry_run: false,
+                ..Default::default()
             },
         );
         state.policies.insert(
@@ -1545,6 +1615,7 @@ mod tests {
                 ],
                 scope: rbac::RbacScope::Namespace,
                 dry_run: false,
+                ..Default::default()
             },
         );
 
@@ -1629,6 +1700,7 @@ mod tests {
                 }]]],
                 scope: rbac::RbacScope::Namespace,
                 dry_run: false,
+                ..Default::default()
             },
         );
 
@@ -1655,6 +1727,7 @@ mod tests {
                 ],
                 scope: rbac::RbacScope::Namespace,
                 dry_run: true,
+                ..Default::default()
             },
         );
 
@@ -1673,6 +1746,7 @@ mod tests {
                 }]]],
                 scope: rbac::RbacScope::Namespace,
                 dry_run: false,
+                ..Default::default()
             },
         );
 
@@ -1691,6 +1765,7 @@ mod tests {
                 }]]],
                 scope: rbac::RbacScope::Namespace,
                 dry_run: true,
+                ..Default::default()
             },
         );
 

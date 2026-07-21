@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,6 +49,8 @@ const NODE_NAME: &str = "NODE_NAME";
 const NAME: &str = "NAME";
 const NAMESPACE: &str = "NAMESPACE";
 const EMPTY_STR: &str = "";
+const ISTIO_VERSION: &str = "ISTIO_VERSION";
+const ISTIO_META_ISTIO_VERSION: &str = "ISTIO_META_ISTIO_VERSION";
 const ISTIO_METAJSON_PREFIX: &str = "ISTIO_METAJSON_";
 
 #[derive(Eq, Hash, PartialEq, Debug, Clone)]
@@ -213,6 +216,8 @@ pub struct Config {
     handlers: HashMap<Strng, Box<dyn RawHandler>>,
     initial_requests: Vec<DeltaDiscoveryRequest>,
     on_demand: bool,
+    /// Types that subscribe but do not block readiness.
+    optional_types: HashSet<String>,
 
     /// alt_hostname provides an alternative accepted SAN for the control plane TLS verification
     alt_hostname: Option<String>,
@@ -262,6 +267,7 @@ impl Config {
             handlers: HashMap::new(),
             initial_requests: Vec::new(),
             on_demand: config.xds_on_demand,
+            optional_types: HashSet::new(),
             proxy_metadata: config.proxy_metadata.clone(),
             alt_hostname: config.alt_xds_hostname.clone(),
             xds_headers: config.xds_headers.vec.clone(),
@@ -275,6 +281,14 @@ impl Config {
         let no_on_demand = f.no_on_demand();
         self.with_handler(type_url.clone(), f)
             .watch(type_url, no_on_demand)
+    }
+
+    pub fn with_optional_watched_handler<F>(mut self, type_url: Strng, f: impl Handler<F>) -> Config
+    where
+        F: 'static + fmt::Debug + prost::Message + Default,
+    {
+        self.optional_types.insert(type_url.to_string());
+        self.with_watched_handler(type_url, f)
     }
 
     fn with_handler<F>(mut self, type_url: Strng, f: impl Handler<F>) -> Config
@@ -342,11 +356,14 @@ impl Config {
         let ns = ns.as_deref().unwrap_or(EMPTY_STR);
         let node_name = std::env::var(NODE_NAME);
         let node_name = node_name.as_deref().unwrap_or(EMPTY_STR);
+        let istio_version = std::env::var(ISTIO_META_ISTIO_VERSION);
+        let istio_version = istio_version.as_deref().unwrap_or(EMPTY_STR);
         let mut metadata = Self::build_struct([
             (NAME, pod_name),
             (NAMESPACE, ns),
             (INSTANCE_IPS, ip),
             (NODE_NAME, node_name),
+            (ISTIO_VERSION, istio_version),
         ]);
         metadata
             .fields
@@ -488,7 +505,8 @@ impl AdsClient {
         let types_to_expect: HashSet<String> = config
             .initial_requests
             .iter()
-            .filter(|e| !Self::is_initial_request_on_demand(e)) // is_empty implies not ondemand
+            .filter(|e| !Self::is_initial_request_on_demand(e))
+            .filter(|e| !config.optional_types.contains(&e.type_url))
             .map(|e| e.type_url.clone())
             .collect();
         AdsClient {
@@ -888,6 +906,7 @@ mod tests {
                 }],
             }],
             dry_run: false,
+            auth_extensions: vec![],
         };
         ProtoResource {
             name: format!("foo{i}"),
@@ -975,10 +994,11 @@ mod tests {
                         src_identity: None,
                         src: std::net::SocketAddr::new(std::net::Ipv4Addr::new(1, 2, 3, 4).into(), 80),
                         dst_network: "".into(),
+                        direction: crate::rbac::Direction::Inbound,
                     };
                     let rbac_ctx = crate::state::ProxyRbacContext {
                         conn: conn.clone(),
-                        dest_workload: Arc::new(test_default_workload()),
+                        workload: Arc::new(test_default_workload()),
                     };
 
                     // rbac should reject port 80
@@ -990,7 +1010,7 @@ mod tests {
                     };
                     let rbac_ctx = crate::state::ProxyRbacContext {
                         conn,
-                        dest_workload: Arc::new(test_default_workload()),
+                        workload: Arc::new(test_default_workload()),
                     };
 
                     // but allow port 81

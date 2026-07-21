@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,15 +36,17 @@ use crate::proxy::h2::server::{H2Request, RequestParts};
 use crate::proxy::metrics::{ConnectionOpen, Reporter};
 use crate::proxy::{
     BAGGAGE_HEADER, ProxyInputs, TRACEPARENT_HEADER, TraceParent, X_FORWARDED_NETWORK_HEADER,
+    connection_manager::{ConnectionAttributes, ConnectionContext, InboundAttributes},
     metrics,
 };
 use crate::rbac::Connection;
-use crate::socket::to_canonical;
+use crate::socket::{SELF_ADDR_V4, SELF_ADDR_V6, to_canonical};
 use crate::state::service::Service;
 use crate::{assertions, copy, handle_connection, proxy, socket, strng, tls};
 
 use crate::drain::run_with_drain;
 use crate::proxy::h2;
+use crate::rbac::Direction;
 use crate::state::workload::address::Address;
 use crate::state::workload::application_tunnel::Protocol;
 use crate::state::workload::{self, NetworkAddress, Workload};
@@ -143,6 +146,7 @@ impl Inbound {
                         src,
                         dst_network: network.clone(), // inbound request must be on our network
                         dst,
+                        direction: Direction::Inbound,
                     };
                     debug!(%conn, "accepted connection");
                     let cfg = pi.cfg.clone();
@@ -235,7 +239,15 @@ impl Inbound {
             // Define a connection guard to ensure rbac conditions are maintained for the duration of the connection
             let conn_guard = pi
                 .connection_manager
-                .assert_rbac(&pi.state, &ri.rbac_ctx, ri.for_host)
+                .assert_rbac(
+                    &pi.state,
+                    ConnectionContext {
+                        rbac_ctx: ri.rbac_ctx.clone(),
+                        attributes: ConnectionAttributes::Inbound(InboundAttributes {
+                            dest_service: ri.for_host,
+                        }),
+                    },
+                )
                 .await
                 .map_err(InboundFlagError::build(
                     StatusCode::UNAUTHORIZED,
@@ -248,7 +260,7 @@ impl Inbound {
                 && ri
                     .tunnel_request
                     .as_ref()
-                    .map(|tr| tr.protocol.supports_localhost_send())
+                    .map(|tr: &TunnelRequest| tr.protocol.supports_localhost_send())
                     .unwrap_or(false);
             let (src, dst) = if localhost_tunnel {
                 // guess the family based on the destination address
@@ -271,11 +283,19 @@ impl Inbound {
                 // causing `freebind_connect` to use a local IP for the connection to ztunnel's own service.
                 // For regular inbound traffic to other workloads, `disable_inbound_freebind` is false, and original source
                 // preservation depends on `enable_original_source`.
-                let upstream_src_ip = if pi.disable_inbound_freebind {
+                let upstream_src_ip = if pi.cfg.sidecar_mode {
+                    let self_addr = if ri.upstream_addr.is_ipv4() {
+                        IpAddr::V4(SELF_ADDR_V4)
+                    } else {
+                        IpAddr::V6(SELF_ADDR_V6)
+                    };
+                    Some(self_addr)
+                } else if pi.disable_inbound_freebind {
                     None
                 } else {
                     enable_original_source.then_some(ri.rbac_ctx.conn.src.ip())
                 };
+
                 (upstream_src_ip, ri.upstream_addr)
             };
 
@@ -396,7 +416,7 @@ impl Inbound {
 
         let rbac_ctx = ProxyRbacContext {
             conn,
-            dest_workload: destination_workload.clone(),
+            workload: destination_workload.clone(),
         };
 
         let for_host = parse_forwarded_host(req);
@@ -871,6 +891,7 @@ mod tests {
             src: format!("{CLIENT_POD_IP}:1234").parse().unwrap(),
             dst_network: "".into(),
             dst: format!("{connection_dst}:15008").parse().unwrap(),
+            direction: crate::rbac::Direction::Inbound,
         };
         let local_wl = state
             .fetch_workload_by_address(&NetworkAddress {
@@ -935,6 +956,7 @@ mod tests {
             src: format!("{CLIENT_POD_IP}:1234").parse().unwrap(),
             dst_network: "".into(),
             dst: format!("{connection_dst}:15008").parse().unwrap(),
+            direction: crate::rbac::Direction::Inbound,
         };
         let request_parts = MockParts {
             method: Method::CONNECT,
@@ -969,6 +991,8 @@ mod tests {
             None,
             local_workload,
             false,
+            None,
+            None,
             None,
         ));
         let inbound_request = Inbound::build_inbound_request(&pi, conn, &request_parts).await;

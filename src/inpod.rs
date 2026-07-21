@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,9 +14,14 @@
 // limitations under the License.
 
 use crate::config as zconfig;
+use crate::drain::DrainWatcher;
 use crate::readiness;
+use crate::state::DemandProxyState;
 use metrics::Metrics;
+use std::future::Future;
 use std::sync::Arc;
+use std::thread;
+use tokio::sync::mpsc;
 use workloadmanager::WorkloadProxyManager;
 
 use crate::proxyfactory::ProxyFactory;
@@ -59,6 +65,12 @@ pub enum Error {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct WorkloadUid(String);
 
+impl std::fmt::Display for WorkloadUid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 impl WorkloadUid {
     pub fn new(uid: String) -> Self {
         Self(uid)
@@ -89,18 +101,68 @@ pub fn init_and_new(
     cfg: &zconfig::Config,
     proxy_gen: ProxyFactory,
     ready: readiness::Ready,
+    state: DemandProxyState,
+    drain_rx: DrainWatcher,
+    fw_metrics: crate::firewall::metrics::Metrics,
 ) -> anyhow::Result<WorkloadProxyManager> {
     // verify that we have the permissions for the syscalls we need
     WorkloadProxyManager::verify_syscalls()?;
+
     let admin_handler: Arc<admin::WorkloadManagerAdminHandler> = Default::default();
     admin_server.add_handler(admin_handler.clone());
     let inpod_config = crate::inpod::InPodConfig::new(cfg)?;
+
+    // Set up firewall coordinator channel (only if firewall rules are enabled and nsenter is available)
+    let fw_tx = if cfg.enable_firewall_rules {
+        let nsenter_ok = std::process::Command::new("/usr/bin/nsenter")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !nsenter_ok {
+            tracing::error!(
+                "ENABLE_FIREWALL_RULES is true but nsenter not available at /usr/bin/nsenter"
+            );
+            None
+        } else {
+            match crate::firewall::detect_backend(cfg.firewall_backend, false) {
+                Ok(backend_kind) => {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let proxy_mark = cfg.packet_mark.unwrap_or(1337);
+                    let coordinator = crate::firewall::InpodFirewallController::new(
+                        state,
+                        backend_kind,
+                        rx,
+                        proxy_mark,
+                        cfg.dns_proxy,
+                        fw_metrics,
+                    );
+                    let fw_drain = drain_rx.clone();
+                    spawn_firewall_runtime(async move {
+                        coordinator.run(fw_drain).await;
+                    })
+                    .map_err(|e| anyhow::anyhow!("failed to start firewall runtime: {e}"))?;
+                    Some(tx)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "No firewall backend available for inpod mode: {}, firewall rules will not be enforced",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
 
     let state_mgr = statemanager::WorkloadProxyManagerState::new(
         proxy_gen,
         inpod_config,
         metrics,
         admin_handler,
+        fw_tx,
     );
 
     Ok(WorkloadProxyManager::new(
@@ -108,4 +170,43 @@ pub fn init_and_new(
         state_mgr,
         ready,
     )?)
+}
+
+fn spawn_firewall_runtime<F>(future: F) -> std::io::Result<thread::JoinHandle<()>>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    thread::Builder::new()
+        .name("ztunnel-fw".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("firewall runtime builds");
+            runtime.block_on(future);
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn firewall_runtime_runs_task_on_dedicated_thread() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let handle = spawn_firewall_runtime(async move {
+            let name = std::thread::current()
+                .name()
+                .map(str::to_string)
+                .unwrap_or_default();
+            tx.send(name).unwrap();
+        })
+        .unwrap();
+
+        let thread_name = rx.await.unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(thread_name, "ztunnel-fw");
+    }
 }

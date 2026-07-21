@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -439,6 +440,7 @@ pub(crate) mod tests {
                 f.ipc,
                 f.inpod_metrics.clone(),
                 Default::default(),
+                None,
             );
             Fixture {
                 state,

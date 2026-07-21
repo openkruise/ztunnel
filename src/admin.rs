@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -746,10 +747,13 @@ mod tests {
                                 "spiffe://cluster.local/ns/ns/sa/not-sa".to_string(),
                             )),
                         }],
+                        destination_port_ranges: vec![],
+                        not_destination_port_ranges: vec![],
                     }],
                 }],
             }],
             dry_run: false,
+            auth_extensions: vec![],
             // ..Default::default() // intentionally don't default. we want all fields populated
         };
 

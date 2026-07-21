@@ -35,7 +35,15 @@ lint-copyright:
 	@${FINDFILES} \( -name '*.go' -o -name '*.rs' \) \( ! \( -name '*.gen.go' -o -name '*.pb.go' -o -name '*_pb2.py' \) \) -print0 |\
 		${XARGS} common/scripts/lint_copyright_banner.sh
 
-lint: lint-scripts lint-yaml lint-markdown lint-licenses lint-copyright
+COPYRIGHT_BASE ?= 1.29.5
+
+lint-copyright-kruise:
+	@./scripts/lint_copyright_kruise.sh "${COPYRIGHT_BASE}"
+
+fix-copyright-kruise:
+	@./scripts/fix_copyright_kruise.sh "${COPYRIGHT_BASE}"
+
+lint: lint-scripts lint-yaml lint-markdown lint-licenses lint-copyright lint-copyright-kruise
 	cargo clippy --benches --tests --bins $(FEATURES)
 
 check:
@@ -47,7 +55,7 @@ cve-check:
 license-check:
 	cargo deny check licenses $(FEATURES)
 
-fix: fix-copyright-banner
+fix: fix-copyright-banner fix-copyright-kruise
 	cargo clippy --fix --allow-staged --allow-dirty $(FEATURES)
 	cargo fmt
 

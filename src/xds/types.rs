@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +30,16 @@ pub mod service {
 
 #[allow(warnings)]
 #[warn(clippy::derive_partial_eq_without_eq)]
+pub mod kruise {
+    pub mod networking {
+        pub mod extensions {
+            pub mod v1 {
+                tonic::include_proto!("kruise.networking.extensions.v1");
+            }
+        }
+    }
+}
+
 pub mod istio {
     pub mod workload {
         tonic::include_proto!("istio.workload");
@@ -44,3 +55,18 @@ pub mod istio {
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
 pub const AUTHORIZATION_TYPE: Strng =
     strng::literal!("type.googleapis.com/istio.security.Authorization");
+pub const WORKLOAD_CONFIG_TYPE: Strng =
+    strng::literal!("type.googleapis.com/kruise.networking.extensions.v1.WorkloadConfig");
+
+#[cfg(test)]
+mod tests {
+    use super::WORKLOAD_CONFIG_TYPE;
+
+    #[test]
+    fn workload_config_resource_type_matches_control_plane() {
+        assert_eq!(
+            &*WORKLOAD_CONFIG_TYPE,
+            "type.googleapis.com/kruise.networking.extensions.v1.WorkloadConfig"
+        );
+    }
+}

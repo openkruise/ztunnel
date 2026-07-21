@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,6 +29,7 @@ use tracing::{debug, info, instrument, trace, warn};
 pub use client::*;
 pub use metrics::*;
 pub use types::*;
+pub type XdsWorkloadConfig = xds::kruise::networking::extensions::v1::WorkloadConfig;
 use xds::istio::security::Authorization as XdsAuthorization;
 use xds::istio::workload::Address as XdsAddress;
 use xds::istio::workload::PortList;
@@ -285,6 +287,31 @@ impl ProxyStateUpdateMutator {
         info!("handling RBAC delete {}", xds_name);
         state.policies.remove(xds_name);
     }
+
+    pub fn insert_workload_config(
+        &self,
+        state: &mut ProxyState,
+        name: Strng,
+        resource: XdsWorkloadConfig,
+    ) -> anyhow::Result<()> {
+        info!("handling workload config update {}", name);
+        let scope = resource.scope();
+        let namespace = Strng::from(name.split('/').next().unwrap_or(""));
+        let proto_policies = xds::kruise::networking::extensions::v1::EgressPolicies {
+            egress_policies: resource.egress_policies,
+        };
+        let policies = crate::extensions::extensions::EgressPolicies::try_from(proto_policies)?;
+        let data = crate::state::workload_config::WorkloadConfigData {
+            egress_policies: policies,
+        };
+        state.workload_configs.insert(name, namespace, scope, data);
+        Ok(())
+    }
+
+    pub fn remove_workload_config(&self, state: &mut ProxyState, name: Strng) {
+        info!("handling workload config delete {}", name);
+        state.workload_configs.remove(name);
+    }
 }
 
 impl Handler<XdsWorkload> for ProxyStateUpdater {
@@ -378,6 +405,44 @@ impl Handler<XdsAuthorization> for ProxyStateUpdater {
                 if e.len() < len_updates {
                     // not all config was rejected, we have _some_ valide update
                     state.policies.send();
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Handler<XdsWorkloadConfig> for ProxyStateUpdater {
+    fn no_on_demand(&self) -> bool {
+        true
+    }
+
+    fn handle(
+        &self,
+        updates: Box<&mut dyn Iterator<Item = XdsUpdate<XdsWorkloadConfig>>>,
+    ) -> Result<(), Vec<RejectedConfig>> {
+        let mut state = self.state.write().unwrap();
+        let handle = |res: XdsUpdate<XdsWorkloadConfig>| {
+            match res {
+                XdsUpdate::Update(w) => self
+                    .updater
+                    .insert_workload_config(&mut state, w.name, w.resource)?,
+                XdsUpdate::Remove(name) => {
+                    self.updater.remove_workload_config(&mut state, name);
+                }
+            }
+            Ok(())
+        };
+        let mut len_updates = 0;
+        let updates = updates.inspect(|_| len_updates += 1);
+        match handle_single_resource(updates, handle) {
+            Ok(()) => {
+                state.workload_configs.send();
+                Ok(())
+            }
+            Err(e) => {
+                if e.len() < len_updates {
+                    state.workload_configs.send();
                 }
                 Err(e)
             }
@@ -487,5 +552,59 @@ impl LocalClient {
         }
         info!(%num_workloads, %num_policies, "local config initialized");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod workload_config_tests {
+    use super::*;
+    use crate::extensions::extensions::EgressPolicyAction;
+
+    fn workload_config(action: i32, ports: &[&str]) -> XdsWorkloadConfig {
+        XdsWorkloadConfig {
+            scope: xds::kruise::networking::extensions::v1::WorkloadConfigScope::Global as i32,
+            egress_policies: vec![xds::kruise::networking::extensions::v1::EgressPolicy {
+                match_ports: ports.iter().map(|port| (*port).to_string()).collect(),
+                policy: action,
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn invalid_workload_config_is_rejected_without_replacing_previous_value() {
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let updater = ProxyStateUpdater::new_no_fetch(state.clone());
+        let handler = &updater as &dyn Handler<XdsWorkloadConfig>;
+        let name = strng::literal!("agentio-system/default");
+
+        let valid = XdsResource {
+            name: name.clone(),
+            resource: workload_config(1, &["443"]),
+        };
+        assert!(
+            handler
+                .handle(Box::new(&mut vec![XdsUpdate::Update(valid)].into_iter()))
+                .is_ok()
+        );
+
+        let invalid = XdsResource {
+            name: name.clone(),
+            resource: workload_config(0, &["invalid"]),
+        };
+        assert!(
+            handler
+                .handle(Box::new(&mut vec![XdsUpdate::Update(invalid)].into_iter()))
+                .is_err()
+        );
+
+        let state = state.read().unwrap();
+        let stored = state.workload_configs.all().get(&name).unwrap();
+        assert_eq!(stored.egress_policies.policies.len(), 1);
+        assert_eq!(
+            stored.egress_policies.policies[0].policy,
+            EgressPolicyAction::Deny
+        );
+        assert_eq!(stored.egress_policies.policies[0].match_ports, vec![443]);
     }
 }

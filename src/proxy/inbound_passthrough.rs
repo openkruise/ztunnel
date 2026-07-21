@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,9 +26,15 @@ use crate::drain::DrainWatcher;
 use crate::drain::run_with_drain;
 use crate::proxy::Error;
 use crate::proxy::metrics::Reporter;
-use crate::proxy::{ProxyInputs, metrics, util};
+use crate::proxy::{
+    ProxyInputs,
+    connection_manager::{ConnectionAttributes, ConnectionContext, InboundAttributes},
+    metrics, util,
+};
+use crate::socket::to_canonical;
+use crate::socket::to_self_socket_addr;
 use crate::state::workload::NetworkAddress;
-use crate::{assertions, copy, handle_connection, rbac, strng};
+use crate::{assertions, copy, handle_connection, rbac, rbac::Direction, strng};
 use crate::{proxy, socket};
 
 pub(super) struct InboundPassthrough {
@@ -160,8 +167,9 @@ impl InboundPassthrough {
                 // by definition, without the gateway our source must be on our network.
                 dst_network: strng::new(&pi.cfg.network),
                 dst: dest_addr,
+                direction: Direction::Inbound,
             },
-            dest_workload: upstream_workload.clone(),
+            workload: upstream_workload.clone(),
         };
 
         // Find source info. We can lookup by XDS or from connection attributes
@@ -208,7 +216,15 @@ impl InboundPassthrough {
 
         let mut conn_guard = match pi
             .connection_manager
-            .assert_rbac(&pi.state, &rbac_ctx, None)
+            .assert_rbac(
+                &pi.state,
+                ConnectionContext {
+                    rbac_ctx: rbac_ctx.clone(),
+                    attributes: ConnectionAttributes::Inbound(InboundAttributes {
+                        dest_service: None,
+                    }),
+                },
+            )
             .await
         {
             Ok(cg) => cg,
@@ -221,13 +237,14 @@ impl InboundPassthrough {
 
         let orig_src = if enable_orig_src {
             Some(source_addr.ip())
+        } else if pi.cfg.sidecar_mode {
+            Some(to_self_socket_addr(to_canonical(source_addr)).ip())
         } else {
             None
         };
 
         let send = async {
             trace!(%source_addr, %dest_addr, component="inbound plaintext", "connecting...");
-
             let outbound = super::freebind_connect(orig_src, dest_addr, pi.socket_factory.as_ref())
                 .await
                 .map_err(Error::ConnectionFailed)?;

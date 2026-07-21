@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,10 +25,12 @@ use prometheus_client::registry::Registry;
 
 use crate::config::Config;
 use crate::drain::DrainWatcher;
-use crate::hyper_util;
+use crate::{hyper_util, probe};
 
 pub struct Server {
     s: hyper_util::Server<Mutex<Registry>>,
+
+    probe_server: Option<Arc<probe::Server>>,
 }
 
 impl Server {
@@ -36,6 +39,20 @@ impl Server {
         drain_rx: DrainWatcher,
         registry: Registry,
     ) -> anyhow::Result<Self> {
+        let probe_server = if config.sidecar_mode {
+            config
+                .kube_app_probes
+                .as_ref()
+                .map(|_| {
+                    probe::Server::new(config.clone())
+                        .map(Arc::new)
+                        .map_err(|e| anyhow::anyhow!("failed to initialize probe server: {e}"))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
         hyper_util::Server::<Mutex<Registry>>::bind(
             "stats",
             config.stats_addr,
@@ -43,7 +60,7 @@ impl Server {
             Mutex::new(registry),
         )
         .await
-        .map(|s| Server { s })
+        .map(|s| Server { s, probe_server })
     }
 
     pub fn address(&self) -> SocketAddr {
@@ -51,10 +68,31 @@ impl Server {
     }
 
     pub fn spawn(self) {
-        self.s.spawn(|registry, req| async move {
-            match req.uri().path() {
-                "/metrics" | "/stats/prometheus" => Ok(handle_metrics(registry, req).await),
-                _ => Ok(hyper_util::empty_response(hyper::StatusCode::NOT_FOUND)),
+        let probe_server = self.probe_server;
+
+        self.s.spawn(move |registry, req| {
+            let probe_server = probe_server.clone();
+
+            async move {
+                let path = req.uri().path();
+
+                if path == "/metrics" || path == "/stats/prometheus" {
+                    return Ok(handle_metrics(registry, req).await);
+                }
+
+                if path.starts_with("/app-health/") {
+                    return match probe_server {
+                        Some(ps) => match ps.handle_app_probe(req).await {
+                            Ok(response) => Ok(response),
+                            Err(_) => Ok(hyper_util::empty_response(
+                                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        },
+                        None => Ok(hyper_util::empty_response(hyper::StatusCode::NOT_FOUND)),
+                    };
+                }
+
+                Ok(hyper_util::empty_response(hyper::StatusCode::NOT_FOUND))
             }
         })
     }

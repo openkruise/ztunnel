@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -115,7 +116,7 @@ impl Socks5 {
                             debug!(component="socks5", dur=?start.elapsed(), "connection completed");
                         }).instrument(span);
 
-                        assertions::size_between_ref(1000, 2000, &serve);
+                        assertions::size_between_ref(1000, 2500, &serve);
                         tokio::spawn(serve);
                     }
                     Err(e) => {

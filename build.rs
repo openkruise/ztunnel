@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +28,7 @@ fn main() -> Result<(), anyhow::Error> {
         "proto/authorization.proto",
         "proto/citadel.proto",
         "proto/zds.proto",
+        "proto/extensions.proto",
     ]
     .iter()
     .map(|name| std::env::current_dir().unwrap().join(name))

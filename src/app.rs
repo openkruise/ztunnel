@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +18,7 @@ use std::future::Future;
 use crate::proxyfactory::ProxyFactory;
 
 use crate::drain;
+use crate::sandbox::sandbox;
 use anyhow::Context;
 use prometheus_client::registry::Registry;
 use std::net::SocketAddr;
@@ -28,7 +30,7 @@ use tokio::task::JoinSet;
 use tracing::{Instrument, warn};
 
 use crate::identity::SecretManager;
-use crate::state::ProxyStateManager;
+use crate::state::{DemandProxyState, ProxyStateManager};
 use crate::{admin, config, metrics, proxy, readiness, signal};
 use crate::{dns, xds};
 
@@ -125,6 +127,21 @@ pub async fn build_with_cert(
     let mut tcp_dns_proxy_address: Option<SocketAddr> = None;
     let mut udp_dns_proxy_address: Option<SocketAddr> = None;
 
+    let mut sandbox_manager = None;
+    if config.enable_sandbox_manager {
+        let mut manager = sandbox::SandboxManager::new();
+        manager.run(config.sandbox_token_path.clone().into()).await;
+        sandbox_manager = Some(Arc::new(manager));
+    }
+
+    let firewall_metrics = if config.sidecar_mode && config.enable_firewall_rules {
+        Some(crate::firewall::metrics::Metrics::new(
+            crate::metrics::sub_registry(&mut registry),
+        ))
+    } else {
+        None
+    };
+
     let proxy_gen = ProxyFactory::new(
         config.clone(),
         state.clone(),
@@ -132,6 +149,8 @@ pub async fn build_with_cert(
         proxy_metrics,
         dns_metrics,
         drain_rx.clone(),
+        sandbox_manager,
+        firewall_metrics,
     )
     .map_err(|e| anyhow::anyhow!("failed to start proxy factory {:?}", e))?;
 
@@ -163,6 +182,7 @@ pub async fn build_with_cert(
             proxy_gen,
             ready.clone(),
             drain_rx.clone(),
+            state.clone(),
         )?;
 
         let mut xds_rx_for_proxy = xds_rx.clone();
@@ -339,6 +359,7 @@ fn init_inpod_proxy_mgr(
     _proxy_gen: ProxyFactory,
     _ready: readiness::Ready,
     _drain_rx: drain::DrainWatcher,
+    _state: DemandProxyState,
 ) -> anyhow::Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>> {
     anyhow::bail!("in-pod mode is not supported on non-linux platforms")
 }
@@ -351,12 +372,23 @@ fn init_inpod_proxy_mgr(
     proxy_gen: ProxyFactory,
     ready: readiness::Ready,
     drain_rx: drain::DrainWatcher,
+    state: DemandProxyState,
 ) -> anyhow::Result<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>> {
     let metrics = Arc::new(crate::inpod::metrics::Metrics::new(
         registry.sub_registry_with_prefix("workload_manager"),
     ));
-    let proxy_mgr = crate::inpod::init_and_new(metrics, admin_server, config, proxy_gen, ready)
-        .map_err(|e| anyhow::anyhow!("failed to start workload proxy manager {:?}", e))?;
+    let fw_metrics = crate::firewall::metrics::Metrics::new(crate::metrics::sub_registry(registry));
+    let proxy_mgr = crate::inpod::init_and_new(
+        metrics,
+        admin_server,
+        config,
+        proxy_gen,
+        ready,
+        state,
+        drain_rx.clone(),
+        fw_metrics,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to start workload proxy manager {:?}", e))?;
 
     Ok(Box::pin(async move {
         match proxy_mgr.run(drain_rx).await {

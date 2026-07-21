@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +16,11 @@
 use crate::identity::Identity;
 
 use crate::baggage::Baggage;
+use crate::extensions::extensions::{AuthExtension, EgressPolicies, EgressPolicyError};
 use crate::state::WorkloadInfo;
 use crate::strng::Strng;
 use crate::xds::istio::workload::{Port, PortList};
+use crate::xds::kruise::networking::extensions::v1::{MeshInternalTrafficPolicy, WorkloadMetadata};
 use crate::{strng, xds};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -284,6 +287,13 @@ pub struct Workload {
 
     #[serde(default = "default_capacity")]
     pub capacity: u32,
+
+    #[serde(skip)]
+    pub encoded_labels: Option<Strng>,
+    #[serde(skip)]
+    pub egress_policies: Option<EgressPolicies>,
+    #[serde(skip)]
+    pub mesh_internal_traffic_policy: MeshInternalTrafficPolicy,
 }
 
 fn default_capacity() -> u32 {
@@ -459,6 +469,19 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                 )),
             })
             .collect::<Result<_, _>>()?;
+
+        let mut metadata: Option<WorkloadMetadata> = None;
+        let mut egress_policies: Option<EgressPolicies> = None;
+
+        for extension in resource.extensions.into_iter() {
+            let extension = AuthExtension::try_from(extension)?;
+            match extension {
+                AuthExtension::WorkloadMetadata(m) => metadata = Some(m),
+                AuthExtension::EgressPolicies(policies) => egress_policies = Some(policies),
+                _ => {}
+            }
+        }
+
         let wl = Workload {
             workload_ips: addresses,
             waypoint: wp,
@@ -524,6 +547,17 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
 
             capacity: resource.capacity.unwrap_or(1),
             services,
+            encoded_labels: metadata
+                .as_ref()
+                .map(|m| Some(strng::new(m.encode_labels())))
+                .unwrap_or_default(),
+            egress_policies,
+            mesh_internal_traffic_policy: metadata
+                .as_ref()
+                .and_then(|m| {
+                    MeshInternalTrafficPolicy::try_from(m.mesh_internal_traffic_policy).ok()
+                })
+                .unwrap_or(MeshInternalTrafficPolicy::MeshInternalPeerAware),
         };
         // Return back part we did not use (service) so it can be consumed without cloning
         Ok((wl, resource.services))
@@ -913,6 +947,8 @@ pub enum WorkloadError {
     DecodeError(#[from] prost::DecodeError),
     #[error("decode error: {0}")]
     EnumError(#[from] prost::UnknownEnumValue),
+    #[error("invalid egress policy: {0}")]
+    EgressPolicy(#[from] EgressPolicyError),
 }
 
 #[cfg(test)]
@@ -927,16 +963,43 @@ mod tests {
     use crate::xds::istio::workload::WorkloadStatus;
     use crate::xds::istio::workload::load_balancing::HealthPolicy;
     use crate::xds::istio::workload::{LoadBalancing, Port as XdsPort};
+    use crate::xds::kruise::networking::extensions::v1 as ext_proto;
     use crate::xds::{LocalClient, ProxyStateUpdateMutator};
     use crate::{cert_fetcher, test_helpers};
     use bytes::Bytes;
     use hickory_resolver::config::{ResolverConfig, ResolverOpts};
     use prometheus_client::registry::Registry;
+    use prost::Message;
+    use prost_types::Any;
     use std::collections::HashSet;
     use std::default::Default;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::RwLock;
     use xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+
+    #[test]
+    fn workload_rejects_invalid_embedded_egress_policy() {
+        let policies = ext_proto::EgressPolicies {
+            egress_policies: vec![ext_proto::EgressPolicy {
+                match_cidrs: vec!["invalid-cidr".into()],
+                ..Default::default()
+            }],
+        };
+        let workload = XdsWorkload {
+            uid: "invalid-policy-workload".into(),
+            extensions: vec![xds::istio::workload::Extension {
+                name: "egress-policies".into(),
+                config: Some(Any {
+                    type_url: "type.googleapis.com/kruise.networking.extensions.v1.EgressPolicies"
+                        .into(),
+                    value: policies.encode_to_vec(),
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(Workload::try_from(workload).is_err());
+    }
 
     #[test]
     fn byte_to_ipaddr_garbage() {

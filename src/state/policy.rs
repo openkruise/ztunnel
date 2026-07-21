@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +46,10 @@ impl Default for PolicyStoreNotify {
 impl PolicyStore {
     pub fn get(&self, key: &Strng) -> Option<&Authorization> {
         self.by_key.get(key)
+    }
+
+    pub fn all_policies(&self) -> impl Iterator<Item = &Authorization> {
+        self.by_key.values()
     }
 
     pub fn get_by_namespace(&self, namespace: &Strng) -> Vec<Strng> {
@@ -128,6 +133,7 @@ mod tests {
                 ..Default::default()
             }]]],
             dry_run: false,
+            ..Default::default()
         };
         let policy_key = policy.to_key();
         // insert this namespace-scoped policy into policystore then assert it is
