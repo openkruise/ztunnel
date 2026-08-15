@@ -415,13 +415,39 @@ impl OutboundConnection {
             builder = builder.header(X_FORWARDED_NETWORK_HEADER, network.as_str());
         }
 
-        if let Some(sandbox_manager) = &self.pi.sandbox_manager {
+        let actor_context = self
+            .pi
+            .state
+            .read()
+            .workload_configs
+            .actor_context()
+            .cloned();
+        if let Some(actor) = actor_context {
+            builder = builder
+                .header(sandbox::SANDBOX_ID_HEADER, actor.actor_uid.as_str())
+                .header(
+                    sandbox::SANDBOX_GENERATION_HEADER,
+                    actor.generation.to_string(),
+                )
+                .header(
+                    sandbox::SANDBOX_LABELS_HEADER,
+                    actor.encoded_labels.as_str(),
+                );
+            if let Some(token) = self
+                .pi
+                .sandbox_manager
+                .as_ref()
+                .and_then(|manager| manager.get_sandbox_token(actor.actor_uid.to_string()))
+            {
+                builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
+            }
+        } else if let Some(sandbox_manager) = &self.pi.sandbox_manager {
+            // Preserve the pre-ActorContext Sandbox contract. Actor-bound
+            // Workers never use this fallback, so their token is still
+            // selected strictly by Actor UID.
             if let Some(token) = sandbox_manager.list_sandbox_tokens().first() {
                 builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
             }
-            // if let Some(sandbox_id) = sandbox_manager.get_sandbox_id() {
-            //     builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox_id.as_str());
-            // }
             if let Some(encoded_labels) = &req.source.encoded_labels {
                 builder = builder.header(sandbox::SANDBOX_LABELS_HEADER, encoded_labels.as_str());
             }
@@ -2237,6 +2263,186 @@ mod tests {
                 .unwrap(),
             "test-network",
             "x-istio-origin-network header should contain the network name for double HBONE inner request"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_context_headers_select_matching_token() {
+        initialize_telemetry();
+
+        let token_dir = tempfile::tempdir().expect("create token directory");
+        std::fs::write(token_dir.path().join("actor-a.token"), "token-a")
+            .expect("write actor-a token");
+        std::fs::write(token_dir.path().join("actor-b.token"), "token-b")
+            .expect("write actor-b token");
+        let mut sandbox_manager = crate::sandbox::sandbox::SandboxManager::new();
+        sandbox_manager.run(token_dir.path().to_path_buf()).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sandbox_manager
+                    .get_sandbox_token("actor-b".to_string())
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial token scan timed out");
+
+        let cfg = Arc::new(Config {
+            local_node: Some("local-node".to_string()),
+            ..crate::config::parse_config().unwrap()
+        });
+        let source = XdsWorkload {
+            uid: "cluster1//v1/Pod/ns/source-workload".to_string(),
+            name: "source-workload".to_string(),
+            namespace: "ns".to_string(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 1])],
+            node: "local-node".to_string(),
+            ..Default::default()
+        };
+        let actor_config = crate::xds::XdsWorkloadConfig {
+            scope: xds::kruise::networking::extensions::v1::WorkloadConfigScope::Global as i32,
+            egress_policies: vec![],
+            actor_context: Some(xds::kruise::networking::extensions::v1::ActorContext {
+                actor_uid: "actor-b".to_string(),
+                actor_name: "crawler".to_string(),
+                atespace: "demo".to_string(),
+                generation: 9,
+                labels: std::collections::HashMap::from([
+                    ("role".to_string(), "reader".to_string()),
+                    ("tenant".to_string(), "tenant-a".to_string()),
+                ]),
+            }),
+        };
+        let state = crate::test_helpers::new_proxy_state_with_workload_configs(
+            &[source],
+            &[],
+            &[],
+            &[("agentio-system/default", actor_config)],
+        );
+
+        let sock_fact = Arc::new(crate::proxy::DefaultSocketFactory::default());
+        let wi = WorkloadInfo {
+            name: "source-workload".to_string(),
+            namespace: "ns".to_string(),
+            service_account: "default".to_string(),
+        };
+        let local_workload_information = Arc::new(LocalWorkloadInformation::new(
+            Arc::new(wi),
+            state.clone(),
+            identity::mock::new_secret_manager(Duration::from_secs(10)),
+        ));
+        let outbound = OutboundConnection {
+            pi: Arc::new(ProxyInputs {
+                state: state.clone(),
+                cfg: cfg.clone(),
+                metrics: test_proxy_metrics(),
+                socket_factory: sock_fact.clone(),
+                local_workload_information: local_workload_information.clone(),
+                connection_manager: ConnectionManager::default(),
+                resolver: None,
+                disable_inbound_freebind: false,
+                crl_manager: None,
+                sandbox_manager: Some(Arc::new(sandbox_manager)),
+                firewall_metrics: None,
+            }),
+            id: TraceParent::new(),
+            pool: WorkloadHBONEPool::new(
+                cfg.clone(),
+                sock_fact,
+                local_workload_information.clone(),
+            ),
+            hbone_port: cfg.inbound_addr.port(),
+        };
+        let source_workload = local_workload_information.get_workload().await.unwrap();
+        let mut req = Request {
+            protocol: OutboundProtocol::HBONE,
+            source: source_workload,
+            hbone_target_destination: Some(HboneAddress::SocketAddr(
+                "10.0.0.1:8080".parse().unwrap(),
+            )),
+            actual_destination_workload: None,
+            intended_destination_service: None,
+            actual_destination: "10.0.0.1:8080".parse().unwrap(),
+            upstream_sans: vec![],
+            final_sans: vec![],
+        };
+
+        let request = outbound.create_hbone_request("127.0.0.1:12345".parse().unwrap(), &req, None);
+        assert_eq!(
+            request.headers().get(sandbox::SANDBOX_ID_HEADER).unwrap(),
+            "actor-b"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(sandbox::SANDBOX_GENERATION_HEADER)
+                .unwrap(),
+            "9"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(sandbox::SANDBOX_LABELS_HEADER)
+                .unwrap(),
+            "cm9sZT1yZWFkZXIsdGVuYW50PXRlbmFudC1h"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(sandbox::SANDBOX_TOKEN_HEADER)
+                .unwrap(),
+            "dG9rZW4tYg=="
+        );
+
+        let mut legacy_source = (*req.source).clone();
+        legacy_source.encoded_labels = Some("bGVnYWN5LWxhYmVscw==".into());
+        req.source = Arc::new(legacy_source);
+
+        let legacy_state =
+            crate::test_helpers::new_proxy_state_with_workload_configs(&[], &[], &[], &[]);
+        let legacy_outbound = OutboundConnection {
+            pi: Arc::new(ProxyInputs {
+                state: legacy_state,
+                cfg: cfg.clone(),
+                metrics: test_proxy_metrics(),
+                socket_factory: outbound.pi.socket_factory.clone(),
+                local_workload_information: local_workload_information.clone(),
+                connection_manager: ConnectionManager::default(),
+                resolver: None,
+                disable_inbound_freebind: false,
+                crl_manager: None,
+                sandbox_manager: outbound.pi.sandbox_manager.clone(),
+                firewall_metrics: None,
+            }),
+            id: TraceParent::new(),
+            pool: WorkloadHBONEPool::new(
+                cfg.clone(),
+                outbound.pi.socket_factory.clone(),
+                local_workload_information,
+            ),
+            hbone_port: cfg.inbound_addr.port(),
+        };
+
+        let request =
+            legacy_outbound.create_hbone_request("127.0.0.1:12345".parse().unwrap(), &req, None);
+        assert_eq!(
+            request
+                .headers()
+                .get(sandbox::SANDBOX_LABELS_HEADER)
+                .unwrap(),
+            "bGVnYWN5LWxhYmVscw==",
+            "Workers without ActorContext must retain legacy workload labels"
+        );
+        assert!(request.headers().get(sandbox::SANDBOX_ID_HEADER).is_none());
+        assert!(
+            request
+                .headers()
+                .get(sandbox::SANDBOX_GENERATION_HEADER)
+                .is_none()
         );
     }
 

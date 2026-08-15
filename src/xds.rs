@@ -297,12 +297,17 @@ impl ProxyStateUpdateMutator {
         info!("handling workload config update {}", name);
         let scope = resource.scope();
         let namespace = Strng::from(name.split('/').next().unwrap_or(""));
+        let actor_context = resource
+            .actor_context
+            .map(crate::state::workload_config::ActorContext::try_from)
+            .transpose()?;
         let proto_policies = xds::kruise::networking::extensions::v1::EgressPolicies {
             egress_policies: resource.egress_policies,
         };
         let policies = crate::extensions::extensions::EgressPolicies::try_from(proto_policies)?;
         let data = crate::state::workload_config::WorkloadConfigData {
             egress_policies: policies,
+            actor_context,
         };
         state.workload_configs.insert(name, namespace, scope, data);
         Ok(())
@@ -568,7 +573,65 @@ mod workload_config_tests {
                 policy: action,
                 ..Default::default()
             }],
+            actor_context: None,
         }
+    }
+
+    #[test]
+    fn actor_context_is_stored_and_replaced_with_workload_config() {
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let updater = ProxyStateUpdater::new_no_fetch(state.clone());
+        let handler = &updater as &dyn Handler<XdsWorkloadConfig>;
+        let name = strng::literal!("agentio-system/default");
+
+        let config = |generation| XdsWorkloadConfig {
+            scope: xds::kruise::networking::extensions::v1::WorkloadConfigScope::Global as i32,
+            egress_policies: vec![],
+            actor_context: Some(xds::kruise::networking::extensions::v1::ActorContext {
+                actor_uid: "actor-uid-1".to_string(),
+                actor_name: "crawler".to_string(),
+                atespace: "demo".to_string(),
+                generation,
+                labels: HashMap::from([
+                    ("role".to_string(), "reader".to_string()),
+                    ("tenant".to_string(), "tenant-a".to_string()),
+                ]),
+            }),
+        };
+
+        for generation in [7, 8] {
+            let resource = XdsResource {
+                name: name.clone(),
+                resource: config(generation),
+            };
+            assert!(
+                handler
+                    .handle(Box::new(&mut vec![XdsUpdate::Update(resource)].into_iter()))
+                    .is_ok()
+            );
+            let state = state.read().unwrap();
+            let actor = state
+                .workload_configs
+                .actor_context()
+                .expect("ActorContext must be present");
+            assert_eq!(actor.actor_uid, "actor-uid-1");
+            assert_eq!(actor.generation, generation);
+            assert_eq!(actor.encoded_labels, "cm9sZT1yZWFkZXIsdGVuYW50PXRlbmFudC1h");
+        }
+
+        handler
+            .handle(Box::new(
+                &mut vec![XdsUpdate::Remove(name.clone())].into_iter(),
+            ))
+            .unwrap();
+        assert!(
+            state
+                .read()
+                .unwrap()
+                .workload_configs
+                .actor_context()
+                .is_none()
+        );
     }
 
     #[test]

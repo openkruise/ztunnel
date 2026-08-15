@@ -306,7 +306,17 @@ impl PolicyWatcher {
     }
 
     pub async fn run(self) {
-        let mut policies_changed = self.state.read().policies.subscribe();
+        let (mut policies_changed, mut workload_configs_changed, mut actor_binding) = {
+            let state = self.state.read();
+            (
+                state.policies.subscribe(),
+                state.workload_configs.subscribe(),
+                state
+                    .workload_configs
+                    .actor_context()
+                    .map(|actor| (actor.actor_uid.clone(), actor.generation)),
+            )
+        };
         loop {
             tokio::select! {
                 _ = self.stop.clone().wait_for_drain() => {
@@ -319,6 +329,26 @@ impl PolicyWatcher {
                             self.connection_manager.close(&conn).await;
                             info!("connection {:?} closed because it's no longer allowed after a policy update", conn);
                         }
+                    }
+                }
+                _ = workload_configs_changed.changed() => {
+                    let next_actor_binding = self
+                        .state
+                        .read()
+                        .workload_configs
+                        .actor_context()
+                        .map(|actor| (actor.actor_uid.clone(), actor.generation));
+                    if next_actor_binding != actor_binding {
+                        let previous_actor_binding = actor_binding;
+                        actor_binding = next_actor_binding.clone();
+                        for conn in self.connection_manager.connections() {
+                            self.connection_manager.close(&conn).await;
+                        }
+                        info!(
+                            ?previous_actor_binding,
+                            ?next_actor_binding,
+                            "all connections closed because the actor binding changed"
+                        );
                     }
                 }
             }
@@ -648,6 +678,84 @@ mod tests {
 
         // send the signal which stops policy watcher
         tx.start_drain_and_wait(drain::DrainMode::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn test_policy_watcher_closes_connections_on_actor_generation_change() {
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let mut registry = Registry::default();
+        let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
+        let dstate = DemandProxyState::new(
+            state.clone(),
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            metrics,
+        );
+        let set_actor = |generation| {
+            let mut state = state.write().unwrap();
+            state.workload_configs.insert(
+                "agentio-system/default".into(),
+                crate::strng::EMPTY,
+                crate::xds::kruise::networking::extensions::v1::WorkloadConfigScope::Global,
+                crate::state::workload_config::WorkloadConfigData {
+                    egress_policies: crate::extensions::extensions::EgressPolicies {
+                        policies: vec![],
+                    },
+                    actor_context: Some(crate::state::workload_config::ActorContext {
+                        actor_uid: "actor-uid-1".into(),
+                        actor_name: "crawler".into(),
+                        atespace: "demo".into(),
+                        generation,
+                        labels: Default::default(),
+                        encoded_labels: "".into(),
+                    }),
+                },
+            );
+            state.workload_configs.send();
+        };
+        set_actor(7);
+
+        let connection_manager = ConnectionManager::default();
+        let conn = ConnectionContext {
+            rbac_ctx: crate::state::ProxyRbacContext {
+                conn: Connection {
+                    src_identity: None,
+                    src: std::net::SocketAddr::new(
+                        std::net::Ipv4Addr::new(192, 168, 0, 1).into(),
+                        80,
+                    ),
+                    dst_network: "".into(),
+                    dst: std::net::SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::new(192, 168, 0, 2),
+                        8080,
+                    )),
+                    direction: crate::rbac::Direction::Inbound,
+                },
+                workload: Arc::new(test_default_workload()),
+            },
+            attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
+        };
+        let close = connection_manager.register(&conn).unwrap();
+
+        let (tx, stop) = drain::new();
+        let watcher = PolicyWatcher::new(dstate, stop, connection_manager);
+        let watcher_task = tokio::spawn(watcher.run());
+        tokio::task::yield_now().await;
+
+        set_actor(7);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), close.clone().wait_for_drain())
+                .await
+                .is_err(),
+            "an unchanged actor binding must not close connections"
+        );
+
+        set_actor(8);
+        assert_close(close).await;
+
+        tx.start_drain_and_wait(drain::DrainMode::Immediate).await;
+        watcher_task.await.unwrap();
     }
 
     // small helper to assert that the Watches are working in a timely manner

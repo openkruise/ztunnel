@@ -15,13 +15,69 @@
 
 use crate::extensions::extensions::EgressPolicies;
 use crate::strng::Strng;
-use crate::xds::kruise::networking::extensions::v1::WorkloadConfigScope;
+use crate::xds::kruise::networking::extensions::v1::{
+    ActorContext as XdsActorContext, WorkloadConfigScope,
+};
+use base64::Engine;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::watch;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorContext {
+    pub actor_uid: Strng,
+    pub actor_name: Strng,
+    pub atespace: Strng,
+    pub generation: u64,
+    pub labels: HashMap<String, String>,
+    pub encoded_labels: Strng,
+}
+
+impl TryFrom<XdsActorContext> for ActorContext {
+    type Error = anyhow::Error;
+
+    fn try_from(value: XdsActorContext) -> Result<Self, Self::Error> {
+        anyhow::ensure!(
+            !value.actor_uid.is_empty(),
+            "ActorContext actor_uid is required"
+        );
+        anyhow::ensure!(
+            !value.actor_name.is_empty(),
+            "ActorContext actor_name is required"
+        );
+        anyhow::ensure!(
+            !value.atespace.is_empty(),
+            "ActorContext atespace is required"
+        );
+        anyhow::ensure!(
+            value.generation > 0,
+            "ActorContext generation must be non-zero"
+        );
+
+        let mut pairs: Vec<_> = value.labels.iter().collect();
+        pairs.sort_by_key(|(key, _)| *key);
+        let labels_text = pairs
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let encoded_labels = base64::engine::general_purpose::STANDARD.encode(labels_text);
+
+        Ok(Self {
+            actor_uid: value.actor_uid.into(),
+            actor_name: value.actor_name.into(),
+            atespace: value.atespace.into(),
+            generation: value.generation,
+            labels: value.labels,
+            encoded_labels: encoded_labels.into(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkloadConfigData {
     pub egress_policies: EgressPolicies,
+    pub actor_context: Option<ActorContext>,
 }
 
 /// A WorkloadConfigStore stores workload configs with a dual-index structure
@@ -85,6 +141,12 @@ impl WorkloadConfigStore {
 
     pub fn all(&self) -> &HashMap<Strng, WorkloadConfigData> {
         &self.by_key
+    }
+
+    pub fn actor_context(&self) -> Option<&ActorContext> {
+        self.by_key
+            .values()
+            .find_map(|config| config.actor_context.as_ref())
     }
 
     /// Insert or replace an extension keyed by its xDS resource name.
@@ -157,6 +219,7 @@ mod tests {
                     gateway: None,
                 }],
             },
+            actor_context: None,
         }
     }
 

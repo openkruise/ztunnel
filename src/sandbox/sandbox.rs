@@ -21,6 +21,7 @@ use crate::watcher::watcher::{AsyncFileWatcher, FileStore};
 
 pub static SANDBOX_TOKEN_HEADER: &str = "x-agentio-sandbox-token";
 pub static SANDBOX_ID_HEADER: &str = "x-agentio-sandbox-id";
+pub static SANDBOX_GENERATION_HEADER: &str = "x-agentio-sandbox-generation";
 pub static SANDBOX_LABELS_HEADER: &str = "x-agentio-sandbox-labels";
 
 // Debounce window for the sandbox token watcher. K8s ConfigMap/Secret remounts
@@ -189,6 +190,7 @@ mod tests {
         // egress gateway; changing them is a breaking change.
         assert_eq!(SANDBOX_TOKEN_HEADER, "x-agentio-sandbox-token");
         assert_eq!(SANDBOX_ID_HEADER, "x-agentio-sandbox-id");
+        assert_eq!(SANDBOX_GENERATION_HEADER, "x-agentio-sandbox-generation");
         assert_eq!(SANDBOX_LABELS_HEADER, "x-agentio-sandbox-labels");
     }
 }

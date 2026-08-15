@@ -100,4 +100,13 @@ enum WorkloadConfigScope {
 message WorkloadConfig {
     WorkloadConfigScope scope = 1;
     repeated EgressPolicy egress_policies = 2;
+    ActorContext actor_context = 3;
+}
+
+message ActorContext {
+    string actor_uid = 1;
+    string actor_name = 2;
+    string atespace = 3;
+    uint64 generation = 4;
+    map<string, string> labels = 5;
 }
