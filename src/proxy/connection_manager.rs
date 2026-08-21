@@ -306,11 +306,17 @@ impl PolicyWatcher {
     }
 
     pub async fn run(self) {
-        let (mut policies_changed, mut workload_configs_changed, mut actor_binding) = {
+        let (
+            mut policies_changed,
+            mut workload_configs_changed,
+            mut workloads_changed,
+            mut actor_binding,
+        ) = {
             let state = self.state.read();
             (
                 state.policies.subscribe(),
                 state.workload_configs.subscribe(),
+                state.workloads.new_subscriber(),
                 state
                     .workload_configs
                     .actor_context()
@@ -349,6 +355,36 @@ impl PolicyWatcher {
                             ?next_actor_binding,
                             "all connections closed because the actor binding changed"
                         );
+                    }
+                }
+                _ = workloads_changed.changed() => {
+                    for conn in self.connection_manager.connections() {
+                        let previous_actor_binding = conn
+                            .rbac_ctx
+                            .workload
+                            .actor_context
+                            .as_ref()
+                            .map(|actor| (actor.actor_uid.clone(), actor.generation));
+                        let next_actor_binding = self
+                            .state
+                            .read()
+                            .workloads
+                            .find_uid(&conn.rbac_ctx.workload.uid)
+                            .and_then(|workload| {
+                                workload
+                                    .actor_context
+                                    .as_ref()
+                                    .map(|actor| (actor.actor_uid.clone(), actor.generation))
+                            });
+                        if next_actor_binding != previous_actor_binding {
+                            self.connection_manager.close(&conn).await;
+                            info!(
+                                workload_uid = %conn.rbac_ctx.workload.uid,
+                                ?previous_actor_binding,
+                                ?next_actor_binding,
+                                "connection closed because the workload actor binding changed"
+                            );
+                        }
                     }
                 }
             }
@@ -753,6 +789,104 @@ mod tests {
 
         set_actor(8);
         assert_close(close).await;
+
+        tx.start_drain_and_wait(drain::DrainMode::Immediate).await;
+        watcher_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_policy_watcher_closes_only_connections_for_updated_workload_actor() {
+        fn actor_workload(
+            uid: &str,
+            actor_uid: &str,
+            generation: u64,
+        ) -> Arc<crate::state::workload::Workload> {
+            let mut workload = test_default_workload();
+            workload.uid = uid.into();
+            workload.actor_context = Some(crate::state::workload_config::ActorContext {
+                actor_uid: actor_uid.into(),
+                actor_name: actor_uid.into(),
+                atespace: "demo".into(),
+                generation,
+                labels: Default::default(),
+                encoded_labels: "".into(),
+            });
+            Arc::new(workload)
+        }
+
+        fn connection(
+            source_port: u16,
+            workload: Arc<crate::state::workload::Workload>,
+        ) -> ConnectionContext {
+            ConnectionContext {
+                rbac_ctx: crate::state::ProxyRbacContext {
+                    conn: Connection {
+                        src_identity: None,
+                        src: std::net::SocketAddr::new(
+                            std::net::Ipv4Addr::new(192, 168, 0, 1).into(),
+                            source_port,
+                        ),
+                        dst_network: "".into(),
+                        dst: std::net::SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::new(192, 168, 0, 2),
+                            8080,
+                        )),
+                        direction: crate::rbac::Direction::Inbound,
+                    },
+                    workload,
+                },
+                attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
+            }
+        }
+
+        let workload_a = actor_workload("cluster//Pod/workers/worker-a", "actor-a", 1);
+        let workload_b = actor_workload("cluster//Pod/workers/worker-b", "actor-b", 1);
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        {
+            let mut state = state.write().unwrap();
+            state.workloads.insert(workload_a.clone());
+            state.workloads.insert(workload_b.clone());
+        }
+        let mut registry = Registry::default();
+        let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
+        let dstate = DemandProxyState::new(
+            state.clone(),
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            metrics,
+        );
+        let connection_manager = ConnectionManager::default();
+        let conn_a = connection(10001, workload_a);
+        let conn_b = connection(10002, workload_b);
+        let close_a = connection_manager.register(&conn_a).unwrap();
+        let close_b = connection_manager.register(&conn_b).unwrap();
+
+        let (tx, stop) = drain::new();
+        let watcher = PolicyWatcher::new(dstate, stop, connection_manager);
+        let watcher_task = tokio::spawn(watcher.run());
+        tokio::task::yield_now().await;
+
+        state.write().unwrap().workloads.insert(actor_workload(
+            "cluster//Pod/workers/worker-a",
+            "actor-a",
+            2,
+        ));
+
+        assert_close(close_a).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), close_b.clone().wait_for_drain())
+                .await
+                .is_err(),
+            "updating worker-a must not close worker-b connections"
+        );
+
+        state
+            .write()
+            .unwrap()
+            .workloads
+            .remove(&"cluster//Pod/workers/worker-b".into());
+        assert_close(close_b).await;
 
         tx.start_drain_and_wait(drain::DrainMode::Immediate).await;
         watcher_task.await.unwrap();

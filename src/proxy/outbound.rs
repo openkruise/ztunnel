@@ -415,13 +415,14 @@ impl OutboundConnection {
             builder = builder.header(X_FORWARDED_NETWORK_HEADER, network.as_str());
         }
 
-        let actor_context = self
-            .pi
-            .state
-            .read()
-            .workload_configs
-            .actor_context()
-            .cloned();
+        let actor_context = req.source.actor_context.clone().or_else(|| {
+            self.pi
+                .state
+                .read()
+                .workload_configs
+                .actor_context()
+                .cloned()
+        });
         if let Some(actor) = actor_context {
             builder = builder
                 .header(sandbox::SANDBOX_ID_HEADER, actor.actor_uid.as_str())
@@ -995,6 +996,8 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use prost::Message;
+    use prost_types::Any;
 
     use super::*;
     use crate::config::Config;
@@ -2280,8 +2283,11 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if sandbox_manager
-                    .get_sandbox_token("actor-b".to_string())
+                    .get_sandbox_token("actor-a".to_string())
                     .is_some()
+                    && sandbox_manager
+                        .get_sandbox_token("actor-b".to_string())
+                        .is_some()
                 {
                     break;
                 }
@@ -2301,6 +2307,24 @@ mod tests {
             namespace: "ns".to_string(),
             addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 1])],
             node: "local-node".to_string(),
+            extensions: vec![xds::istio::workload::Extension {
+                name: "actor-context".into(),
+                config: Some(Any {
+                    type_url: "type.googleapis.com/kruise.networking.extensions.v1.ActorContext"
+                        .into(),
+                    value: xds::kruise::networking::extensions::v1::ActorContext {
+                        actor_uid: "actor-a".into(),
+                        actor_name: "planner".into(),
+                        atespace: "demo".into(),
+                        generation: 7,
+                        labels: std::collections::HashMap::from([
+                            ("role".into(), "planner".into()),
+                            ("tenant".into(), "tenant-a".into()),
+                        ]),
+                    }
+                    .encode_to_vec(),
+                }),
+            }],
             ..Default::default()
         };
         let actor_config = crate::xds::XdsWorkloadConfig {
@@ -2374,32 +2398,33 @@ mod tests {
         let request = outbound.create_hbone_request("127.0.0.1:12345".parse().unwrap(), &req, None);
         assert_eq!(
             request.headers().get(sandbox::SANDBOX_ID_HEADER).unwrap(),
-            "actor-b"
+            "actor-a"
         );
         assert_eq!(
             request
                 .headers()
                 .get(sandbox::SANDBOX_GENERATION_HEADER)
                 .unwrap(),
-            "9"
+            "7"
         );
         assert_eq!(
             request
                 .headers()
                 .get(sandbox::SANDBOX_LABELS_HEADER)
                 .unwrap(),
-            "cm9sZT1yZWFkZXIsdGVuYW50PXRlbmFudC1h"
+            "cm9sZT1wbGFubmVyLHRlbmFudD10ZW5hbnQtYQ=="
         );
         assert_eq!(
             request
                 .headers()
                 .get(sandbox::SANDBOX_TOKEN_HEADER)
                 .unwrap(),
-            "dG9rZW4tYg=="
+            "dG9rZW4tYQ=="
         );
 
         let mut legacy_source = (*req.source).clone();
         legacy_source.encoded_labels = Some("bGVnYWN5LWxhYmVscw==".into());
+        legacy_source.actor_context = None;
         req.source = Arc::new(legacy_source);
 
         let legacy_state =

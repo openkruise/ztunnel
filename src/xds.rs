@@ -182,7 +182,12 @@ impl ProxyStateUpdateMutator {
     )]
     fn remove_internal(&self, state: &mut ProxyState, xds_name: &Strng, for_workload_insert: bool) {
         // remove workload by UID; if xds_name is a service then this will no-op
-        if let Some(prev) = state.workloads.remove(&strng::new(xds_name)) {
+        let previous_workload = if for_workload_insert {
+            state.workloads.remove_for_insert(&strng::new(xds_name))
+        } else {
+            state.workloads.remove(&strng::new(xds_name))
+        };
+        if let Some(prev) = previous_workload {
             // Also remove service endpoints for the workload.
             state.services.remove_endpoint(&prev);
 

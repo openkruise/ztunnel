@@ -19,7 +19,8 @@ use crate::xds::istio::security::Extension;
 use crate::xds::istio::workload::Extension as WorkloadExtension;
 use crate::xds::kruise::networking::extensions::v1 as proto;
 use crate::xds::kruise::networking::extensions::v1::{
-    EgressPolicies as ProtoEgressPolicies, TrafficPolicyExtension, WorkloadMetadata,
+    ActorContext as ProtoActorContext, EgressPolicies as ProtoEgressPolicies,
+    TrafficPolicyExtension, WorkloadMetadata,
 };
 use ipnet::IpNet;
 use prost::Message;
@@ -33,6 +34,8 @@ const WORKLOAD_METADATA_TYPE_URL: &str =
     "type.googleapis.com/kruise.networking.extensions.v1.WorkloadMetadata";
 const DEFAULT_EGRESS_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/kruise.networking.extensions.v1.EgressPolicies";
+const ACTOR_CONTEXT_TYPE_URL: &str =
+    "type.googleapis.com/kruise.networking.extensions.v1.ActorContext";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum EgressPolicyAction {
@@ -107,6 +110,7 @@ pub enum AuthExtension {
     WorkloadMetadata(WorkloadMetadata),
     TrafficPolicy(TrafficPolicyExtension),
     EgressPolicies(EgressPolicies),
+    ActorContext(ProtoActorContext),
     Raw(RawExtension),
 }
 
@@ -136,6 +140,12 @@ impl TryFrom<WorkloadExtension> for AuthExtension {
                     return Ok(AuthExtension::EgressPolicies(EgressPolicies::try_from(
                         policies,
                     )?));
+                }
+                ACTOR_CONTEXT_TYPE_URL => {
+                    if let Ok(actor) = ProtoActorContext::decode(&*any.value) {
+                        debug!("Decoded actor context extension: {:?}", actor);
+                        return Ok(AuthExtension::ActorContext(actor));
+                    }
                 }
                 _ => {}
             }

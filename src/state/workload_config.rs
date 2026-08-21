@@ -20,6 +20,7 @@ use crate::xds::kruise::networking::extensions::v1::{
 };
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -31,6 +32,21 @@ pub struct ActorContext {
     pub generation: u64,
     pub labels: HashMap<String, String>,
     pub encoded_labels: Strng,
+}
+
+impl Hash for ActorContext {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.actor_uid.hash(state);
+        self.actor_name.hash(state);
+        self.atespace.hash(state);
+        self.generation.hash(state);
+        let mut labels: Vec<_> = self.labels.iter().collect();
+        labels.sort_by_key(|(key, _)| *key);
+        for (key, value) in labels {
+            key.hash(state);
+            value.hash(state);
+        }
+    }
 }
 
 impl TryFrom<XdsActorContext> for ActorContext {

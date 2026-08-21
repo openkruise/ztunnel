@@ -18,6 +18,7 @@ use crate::identity::Identity;
 use crate::baggage::Baggage;
 use crate::extensions::extensions::{AuthExtension, EgressPolicies, EgressPolicyError};
 use crate::state::WorkloadInfo;
+use crate::state::workload_config::ActorContext;
 use crate::strng::Strng;
 use crate::xds::istio::workload::{Port, PortList};
 use crate::xds::kruise::networking::extensions::v1::{MeshInternalTrafficPolicy, WorkloadMetadata};
@@ -290,6 +291,8 @@ pub struct Workload {
 
     #[serde(skip)]
     pub encoded_labels: Option<Strng>,
+    #[serde(skip_deserializing, skip_serializing_if = "is_default")]
+    pub actor_context: Option<ActorContext>,
     #[serde(skip)]
     pub egress_policies: Option<EgressPolicies>,
     #[serde(skip)]
@@ -472,12 +475,19 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
 
         let mut metadata: Option<WorkloadMetadata> = None;
         let mut egress_policies: Option<EgressPolicies> = None;
+        let mut actor_context: Option<ActorContext> = None;
 
         for extension in resource.extensions.into_iter() {
             let extension = AuthExtension::try_from(extension)?;
             match extension {
                 AuthExtension::WorkloadMetadata(m) => metadata = Some(m),
                 AuthExtension::EgressPolicies(policies) => egress_policies = Some(policies),
+                AuthExtension::ActorContext(actor) => {
+                    actor_context = Some(
+                        ActorContext::try_from(actor)
+                            .map_err(|err| WorkloadError::ActorContext(err.to_string()))?,
+                    )
+                }
                 _ => {}
             }
         }
@@ -551,6 +561,7 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                 .as_ref()
                 .map(|m| Some(strng::new(m.encode_labels())))
                 .unwrap_or_default(),
+            actor_context,
             egress_policies,
             mesh_internal_traffic_policy: metadata
                 .as_ref()
@@ -837,7 +848,7 @@ impl WorkloadStore {
 
     pub fn insert(&mut self, w: Arc<Workload>) {
         // First, remove the entry entirely to make sure things are cleaned up properly.
-        self.remove(&w.uid);
+        self.remove_internal(&w.uid);
 
         if w.network_mode != NetworkMode::HostNetwork {
             for ip in &w.workload_ips {
@@ -863,6 +874,18 @@ impl WorkloadStore {
     }
 
     pub fn remove(&mut self, uid: &Strng) -> Option<Workload> {
+        let removed = self.remove_internal(uid);
+        if removed.is_some() {
+            self.insert_notifier.send_replace(());
+        }
+        removed
+    }
+
+    pub(crate) fn remove_for_insert(&mut self, uid: &Strng) -> Option<Workload> {
+        self.remove_internal(uid)
+    }
+
+    fn remove_internal(&mut self, uid: &Strng) -> Option<Workload> {
         match self.by_uid.remove(uid) {
             None => {
                 trace!("tried to remove workload but it was not found");
@@ -949,6 +972,8 @@ pub enum WorkloadError {
     EnumError(#[from] prost::UnknownEnumValue),
     #[error("invalid egress policy: {0}")]
     EgressPolicy(#[from] EgressPolicyError),
+    #[error("invalid actor context: {0}")]
+    ActorContext(String),
 }
 
 #[cfg(test)]
@@ -999,6 +1024,68 @@ mod tests {
         };
 
         assert!(Workload::try_from(workload).is_err());
+    }
+
+    #[test]
+    fn workload_decodes_embedded_actor_context() {
+        let actor = ext_proto::ActorContext {
+            actor_uid: "actor-uid-a".into(),
+            actor_name: "actor-a".into(),
+            atespace: "tenant-a".into(),
+            generation: 9,
+            labels: HashMap::from([("role".into(), "reader".into())]),
+        };
+        let workload = XdsWorkload {
+            uid: "cluster//Pod/workers/worker-a".into(),
+            extensions: vec![xds::istio::workload::Extension {
+                name: "actor-context".into(),
+                config: Some(Any {
+                    type_url: "type.googleapis.com/kruise.networking.extensions.v1.ActorContext"
+                        .into(),
+                    value: actor.encode_to_vec(),
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let workload = Workload::try_from(workload).expect("valid embedded ActorContext");
+        let actor = workload
+            .actor_context
+            .expect("ActorContext must be decoded");
+        assert_eq!(actor.actor_uid.as_str(), "actor-uid-a");
+        assert_eq!(actor.generation, 9);
+        assert_eq!(actor.encoded_labels.as_str(), "cm9sZT1yZWFkZXI=");
+    }
+
+    #[test]
+    fn workload_actor_context_is_visible_in_admin_dump() {
+        let actor = ext_proto::ActorContext {
+            actor_uid: "actor-uid-a".into(),
+            actor_name: "actor-a".into(),
+            atespace: "tenant-a".into(),
+            generation: 9,
+            labels: Default::default(),
+        };
+        let workload = Workload::try_from(XdsWorkload {
+            uid: "cluster//Pod/workers/worker-a".into(),
+            extensions: vec![xds::istio::workload::Extension {
+                name: "actor-context".into(),
+                config: Some(Any {
+                    type_url: "type.googleapis.com/kruise.networking.extensions.v1.ActorContext"
+                        .into(),
+                    value: actor.encode_to_vec(),
+                }),
+            }],
+            ..Default::default()
+        })
+        .expect("valid embedded ActorContext");
+
+        let dump = serde_json::to_value(workload).expect("serialize workload admin dump");
+        assert_eq!(
+            dump.pointer("/actorContext/actorUid")
+                .and_then(|v| v.as_str()),
+            Some("actor-uid-a")
+        );
     }
 
     #[test]

@@ -230,6 +230,7 @@ pub fn test_default_workload() -> Workload {
         locality: Default::default(),
         services: Default::default(),
         encoded_labels: None,
+        actor_context: None,
         egress_policies: None,
         mesh_internal_traffic_policy: Default::default(),
     }
