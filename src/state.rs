@@ -25,10 +25,8 @@ use crate::state::workload::{
     GatewayAddress, NamespacedHostname, NetworkAddress, Workload, WorkloadStore, address::Address,
     gatewayaddress::Destination, network_addr,
 };
-use crate::state::workload_config::{WorkloadConfigData, WorkloadConfigStore};
 use crate::strng::Strng;
 use crate::tls;
-use crate::xds::XdsWorkloadConfig;
 use crate::xds::istio::security::Authorization as XdsAuthorization;
 use crate::xds::istio::workload::Address as XdsAddress;
 use crate::xds::{AdsClient, Demander, LocalClient, ProxyStateUpdater};
@@ -59,7 +57,6 @@ use self::workload::ApplicationTunnel;
 pub mod policy;
 pub mod service;
 pub mod workload;
-pub mod workload_config;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Upstream {
@@ -183,8 +180,6 @@ pub struct ProxyState {
     pub services: ServiceStore,
 
     pub policies: PolicyStore,
-
-    pub workload_configs: WorkloadConfigStore,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -193,7 +188,6 @@ struct ProxyStateSerialization<'a> {
     workloads: Vec<Arc<Workload>>,
     services: Vec<Arc<Service>>,
     policies: Vec<Authorization>,
-    workload_configs: Vec<(&'a Strng, &'a WorkloadConfigData)>,
     staged_services: &'a HashMap<NamespacedHostname, HashMap<Strng, Endpoint>>,
 }
 
@@ -228,17 +222,10 @@ impl serde::Serialize for ProxyState {
             .map(|k| k.1)
             .cloned()
             .collect();
-        let workload_configs: Vec<_> = self
-            .workload_configs
-            .all()
-            .iter()
-            .sorted_by_key(|k| k.0)
-            .collect();
         let serializable = ProxyStateSerialization {
             workloads,
             services,
             policies,
-            workload_configs,
             staged_services: &self.services.staged_services,
         };
         serializable.serialize(serializer)
@@ -251,7 +238,6 @@ impl ProxyState {
             workloads: WorkloadStore::new(local_node),
             services: Default::default(),
             policies: Default::default(),
-            workload_configs: Default::default(),
         }
     }
 
@@ -1157,14 +1143,7 @@ impl ProxyStateManager {
             Some(
                 xds::Config::new(config.clone(), tls_client_fetcher)
                     .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
-                    .with_watched_handler::<XdsAuthorization>(
-                        xds::AUTHORIZATION_TYPE,
-                        updater.clone(),
-                    )
-                    .with_optional_watched_handler::<XdsWorkloadConfig>(
-                        xds::WORKLOAD_CONFIG_TYPE,
-                        updater,
-                    )
+                    .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater)
                     .build(xds_metrics, awaiting_ready),
             )
         } else {

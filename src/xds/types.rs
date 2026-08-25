@@ -55,18 +55,3 @@ pub mod istio {
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
 pub const AUTHORIZATION_TYPE: Strng =
     strng::literal!("type.googleapis.com/istio.security.Authorization");
-pub const WORKLOAD_CONFIG_TYPE: Strng =
-    strng::literal!("type.googleapis.com/kruise.networking.extensions.v1.WorkloadConfig");
-
-#[cfg(test)]
-mod tests {
-    use super::WORKLOAD_CONFIG_TYPE;
-
-    #[test]
-    fn workload_config_resource_type_matches_control_plane() {
-        assert_eq!(
-            &*WORKLOAD_CONFIG_TYPE,
-            "type.googleapis.com/kruise.networking.extensions.v1.WorkloadConfig"
-        );
-    }
-}
