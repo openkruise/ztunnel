@@ -806,39 +806,8 @@ impl OutboundConnection {
         source_workload: &Arc<Workload>,
         target: &SocketAddr,
     ) -> Option<Result<Request, Error>> {
-        // Prefer the independent xDS workload extension store; fall back to
-        // workload-embedded policies when the store is empty (backward compat).
-        //
-        // Match inside the read lock to avoid cloning all extensions per connection.
-        // Only the matched action + gateway (if any) are extracted.
-        let matched = {
-            let state = self.pi.state.read();
-            let ns = state
-                .workload_configs
-                .get_by_namespace(&source_workload.namespace);
-            let global = state
-                .workload_configs
-                .get_by_namespace(&crate::strng::EMPTY);
-            if ns.is_empty() && global.is_empty() {
-                match_egress_policy(
-                    source_workload.egress_policies.as_ref()?,
-                    source_workload.namespace.as_ref(),
-                    target,
-                )
-                .map(|p| (p.policy, p.gateway.clone()))
-            } else {
-                ns.into_iter()
-                    .chain(global)
-                    .find_map(|ext| {
-                        match_egress_policy(
-                            &ext.egress_policies,
-                            source_workload.namespace.as_ref(),
-                            target,
-                        )
-                    })
-                    .map(|p| (p.policy, p.gateway.clone()))
-            }
-        };
+        let matched = match_workload_egress_policy(source_workload, target)
+            .map(|policy| (policy.policy, policy.gateway.clone()));
         let (action, gateway) = matched?;
         match action {
             EgressPolicyAction::Passthrough => {
@@ -928,6 +897,17 @@ struct Request {
     // This field only matters if we need to know both the identity of the next hop, as well as the
     // final hop (currently, this is only double HBONE).
     final_sans: Vec<Identity>,
+}
+
+fn match_workload_egress_policy<'a>(
+    source_workload: &'a Workload,
+    target: &SocketAddr,
+) -> Option<&'a EgressPolicy> {
+    match_egress_policy(
+        source_workload.egress_policies.as_ref()?,
+        source_workload.namespace.as_ref(),
+        target,
+    )
 }
 
 /// Find the first egress policy that applies to a connection from
@@ -2248,8 +2228,9 @@ mod tests {
     }
 
     mod match_egress_policy_tests {
-        use super::super::match_egress_policy;
+        use super::super::{match_egress_policy, match_workload_egress_policy};
         use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
+        use crate::test_helpers::test_default_workload;
         use ipnet::IpNet;
         use std::collections::HashSet;
         use std::net::SocketAddr;
@@ -2278,6 +2259,23 @@ mod tests {
 
         fn wrap(policies: Vec<EgressPolicy>) -> EgressPolicies {
             EgressPolicies { policies }
+        }
+
+        #[test]
+        fn source_workload_policy_is_the_only_policy_input() {
+            let mut workload = test_default_workload();
+            workload.namespace = "ns-a".into();
+            workload.egress_policies = Some(wrap(vec![EgressPolicy {
+                policy: EgressPolicyAction::Deny,
+                ..policy_passthrough()
+            }]));
+
+            let got = match_workload_egress_policy(&workload, &target("10.0.0.1:443"))
+                .expect("inline workload policy should match");
+            assert_eq!(got.policy, EgressPolicyAction::Deny);
+
+            workload.egress_policies = None;
+            assert!(match_workload_egress_policy(&workload, &target("10.0.0.1:443")).is_none());
         }
 
         #[test]

@@ -361,27 +361,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decodes_workload_config_wire_format_from_control_plane() {
-        let policy = ext_proto::EgressPolicy {
-            match_cidrs: vec!["10.0.0.0/8".to_string()],
-            policy: ext_proto::EgressPolicyAction::Deny as i32,
-            ..Default::default()
-        };
-        let control_plane_wire = [vec![0x08, ext_proto::WorkloadConfigScope::Global as u8], {
-            let mut field = vec![0x12];
-            policy.encode_length_delimited(&mut field).expect("encode");
-            field
-        }]
-        .concat();
-
-        let decoded = ext_proto::WorkloadConfig::decode(control_plane_wire.as_slice())
-            .expect("control-plane WorkloadConfig wire format should decode");
-
-        assert_eq!(decoded.scope(), ext_proto::WorkloadConfigScope::Global);
-        assert_eq!(decoded.egress_policies.len(), 1);
-    }
-
     // ---- EgressPolicyAction --------------------------------------------
 
     #[test]

@@ -91,13 +91,3 @@ message GatewayAddress {
   // Port is the port to reach the gateway at.
   uint32 port = 2;
 }
-
-enum WorkloadConfigScope {
-    WORKLOAD_CONFIG_SCOPE_GLOBAL = 0;
-    WORKLOAD_CONFIG_SCOPE_NAMESPACE = 1;
-}
-
-message WorkloadConfig {
-    WorkloadConfigScope scope = 1;
-    repeated EgressPolicy egress_policies = 2;
-}

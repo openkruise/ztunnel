@@ -55,16 +55,8 @@ copyright_is_supported() {
 # Files that moved or were adapted from an upstream source need an explicit
 # provenance mapping when Git cannot infer their origin from the base tree.
 copyright_provenance_path() {
-    local path=$1
     local detected_path=$2
-    case "${path}" in
-        src/state/workload_config.rs)
-            printf '%s\n' 'src/state/policy.rs'
-            ;;
-        *)
-            printf '%s\n' "${detected_path}"
-            ;;
-    esac
+    printf '%s\n' "${detected_path}"
 }
 
 copyright_changed_files() {
