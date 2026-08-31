@@ -79,6 +79,7 @@ const FIREWALL_DEBOUNCE_INTERVAL: &str = "FIREWALL_DEBOUNCE_INTERVAL";
 const FIREWALL_MAX_DEBOUNCE_TIME: &str = "FIREWALL_MAX_DEBOUNCE_TIME";
 const ENABLE_SANDBOX_MANAGER: &str = "ENABLE_SANDBOX_MANAGER";
 const SANDBOX_TOKEN_PATH: &str = "SANDBOX_TOKEN_PATH";
+const SANDBOX_WATCHER_DEBOUNCE_MS: &str = "SANDBOX_WATCHER_DEBOUNCE_MS";
 
 const HTTP2_STREAM_WINDOW_SIZE: &str = "HTTP2_STREAM_WINDOW_SIZE";
 const HTTP2_CONNECTION_WINDOW_SIZE: &str = "HTTP2_CONNECTION_WINDOW_SIZE";
@@ -100,6 +101,7 @@ const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
 const DEFAULT_POOL_UNUSED_RELEASE_TIMEOUT: Duration = Duration::from_secs(60 * 5); // 5 minutes
 const DEFAULT_POOL_MAX_STREAMS_PER_CONNECTION: u16 = 100; //Go: 100, Hyper: 200, Envoy: 2147483647 (lol), Spec recommended minimum 100
 const DEFAULT_SANDBOX_TOKEN_PATH: &str = "/var/opt/sandbox/agent-token/";
+const DEFAULT_SANDBOX_WATCHER_DEBOUNCE_MS: u64 = 500;
 
 const DEFAULT_INPOD_MARK: u32 = 1337;
 
@@ -375,6 +377,8 @@ pub struct Config {
     pub enable_sandbox_manager: bool,
 
     pub sandbox_token_path: String,
+
+    pub sandbox_watcher_debounce_ms: u64,
 }
 
 #[derive(serde::Serialize, Clone, Copy, Debug)]
@@ -978,6 +982,10 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             .unwrap_or(false),
         sandbox_token_path: env::var(SANDBOX_TOKEN_PATH)
             .unwrap_or_else(|_| DEFAULT_SANDBOX_TOKEN_PATH.to_string()),
+        sandbox_watcher_debounce_ms: parse_default(
+            SANDBOX_WATCHER_DEBOUNCE_MS,
+            DEFAULT_SANDBOX_WATCHER_DEBOUNCE_MS,
+        )?,
         kube_app_probes: probers,
         probe_keepalive_connections: parse_default("ENABLE_PROBE_KEEPALIVE_CONNECTIONS", false)?,
         pod_ip: parse_default("INSTANCE_IP", "127.0.0.1".to_string())?,
@@ -985,6 +993,12 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
+    if cfg.sandbox_watcher_debounce_ms == 0 {
+        return Err(Error::InvalidState(format!(
+            "{SANDBOX_WATCHER_DEBOUNCE_MS} must be greater than zero"
+        )));
+    }
+
     if cfg.dns_proxy && cfg.xds_on_demand {
         return Err(Error::ProxyConfig(anyhow!(
             "DNS proxy does not currently support on-demand mode"
@@ -1186,6 +1200,8 @@ impl Address {
 pub mod tests {
     use super::*;
 
+    static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn parses_firewall_backend_mode() {
         assert_eq!(FirewallBackendMode::default(), FirewallBackendMode::Auto);
@@ -1209,6 +1225,44 @@ pub mod tests {
         unsafe {
             env::remove_var(FIREWALL_BACKEND);
         }
+    }
+
+    #[test]
+    fn sandbox_watcher_debounce_ms_is_configurable() {
+        let _guard = SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK.lock().unwrap();
+        unsafe {
+            env::remove_var("SANDBOX_WATCHER_DEBOUNCE_MS");
+        }
+        let default_config = construct_config(ProxyConfig::default())
+            .expect("could not build Config without ProxyConfig");
+        assert_eq!(default_config.sandbox_watcher_debounce_ms, 500);
+
+        unsafe {
+            env::set_var("SANDBOX_WATCHER_DEBOUNCE_MS", "250");
+        }
+        let configured = construct_config(ProxyConfig::default())
+            .expect("could not build Config with sandbox watcher debounce override");
+        unsafe {
+            env::remove_var("SANDBOX_WATCHER_DEBOUNCE_MS");
+        }
+
+        assert_eq!(configured.sandbox_watcher_debounce_ms, 250);
+    }
+
+    #[test]
+    fn sandbox_watcher_debounce_ms_rejects_zero() {
+        let _guard = SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK.lock().unwrap();
+        unsafe {
+            env::remove_var("SANDBOX_WATCHER_DEBOUNCE_MS");
+        }
+        let mut config = construct_config(ProxyConfig::default())
+            .expect("could not build Config without ProxyConfig");
+        config.sandbox_watcher_debounce_ms = 0;
+
+        assert!(matches!(
+            validate_config(config),
+            Err(Error::InvalidState(_))
+        ));
     }
 
     #[test]

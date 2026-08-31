@@ -130,7 +130,12 @@ pub async fn build_with_cert(
     let mut sandbox_manager = None;
     if config.enable_sandbox_manager {
         let mut manager = sandbox::SandboxManager::new();
-        manager.run(config.sandbox_token_path.clone().into()).await;
+        manager
+            .run(
+                config.sandbox_token_path.clone().into(),
+                config.sandbox_watcher_debounce_ms,
+            )
+            .await;
         sandbox_manager = Some(Arc::new(manager));
     }
 

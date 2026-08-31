@@ -23,11 +23,6 @@ pub static SANDBOX_TOKEN_HEADER: &str = "x-agentio-sandbox-token";
 pub static SANDBOX_ID_HEADER: &str = "x-agentio-sandbox-id";
 pub static SANDBOX_LABELS_HEADER: &str = "x-agentio-sandbox-labels";
 
-// Debounce window for the sandbox token watcher. K8s ConfigMap/Secret remounts
-// fire several events in rapid succession; coalescing for 2s keeps the store
-// from churning while a remount is in progress.
-const SANDBOX_WATCHER_DEBOUNCE_MS: u64 = 2000;
-
 /// Transform a raw token file content into the value stored in [`FileStore`].
 /// Wraps the bytes in standard base64 so downstream consumers can ship them
 /// in HTTP headers (`x-agentio-sandbox-token`) without worrying about binary or
@@ -58,16 +53,16 @@ impl SandboxManager {
         }
     }
 
-    pub async fn run(&mut self, token_dir: PathBuf) {
+    pub async fn run(&mut self, token_dir: PathBuf, debounce_ms: u64) {
         tracing::info!(
+            debounce_ms,
             "sandbox mode enabled - starting directory watcher for {:?}",
             token_dir,
         );
 
         let store = Arc::new(FileStore::new(sandbox_token_transform, sandbox_token_key));
 
-        let watcher = AsyncFileWatcher::new(store.clone(), token_dir)
-            .with_debounce_ms(SANDBOX_WATCHER_DEBOUNCE_MS);
+        let watcher = AsyncFileWatcher::new(store.clone(), token_dir).with_debounce_ms(debounce_ms);
 
         match watcher.start().await {
             Ok(handle) => {
