@@ -12,4 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod discovery;
 pub mod sandbox;
+pub mod traffic_policy;

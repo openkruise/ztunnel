@@ -16,6 +16,7 @@
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
 use crate::rbac::{Authorization, Direction, RbacDecision};
+use crate::sandbox::{discovery::Sandbox, traffic_policy};
 use crate::state::policy::PolicyStore;
 use crate::state::service::{
     Endpoint, IpFamily, LoadBalancerMode, LoadBalancerScopes, ServiceStore,
@@ -158,6 +159,21 @@ pub struct ProxyRbacContext {
     pub conn: rbac::Connection,
     #[educe(Hash(ignore), PartialEq(ignore))]
     pub workload: Arc<Workload>,
+    // Retain the selected Sandbox; policy rechecks resolve its UID in the current store.
+    #[serde(skip_serializing)]
+    #[educe(
+        PartialEq(method(same_sandbox_identity)),
+        Hash(method(hash_sandbox_identity))
+    )]
+    pub sandbox: Option<Arc<Sandbox>>,
+}
+
+fn same_sandbox_identity(left: &Option<Arc<Sandbox>>, right: &Option<Arc<Sandbox>>) -> bool {
+    left.as_ref().map(|s| &s.uid) == right.as_ref().map(|s| &s.uid)
+}
+
+fn hash_sandbox_identity<H: std::hash::Hasher>(sandbox: &Option<Arc<Sandbox>>, state: &mut H) {
+    std::hash::Hash::hash(&sandbox.as_ref().map(|s| &s.uid), state);
 }
 
 impl ProxyRbacContext {
@@ -180,6 +196,8 @@ pub struct ProxyState {
     pub services: ServiceStore,
 
     pub policies: PolicyStore,
+
+    pub sandboxes: crate::sandbox::discovery::SandboxStore,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -238,6 +256,7 @@ impl ProxyState {
             workloads: WorkloadStore::new(local_node),
             services: Default::default(),
             policies: Default::default(),
+            sandboxes: Default::default(),
         }
     }
 
@@ -546,6 +565,23 @@ impl DemandProxyState {
         let wl = ctx.workload.clone();
         let conn = &ctx.conn;
         let state = self.read();
+        let sandbox = match &ctx.sandbox {
+            Some(sandbox) => state
+                .sandboxes
+                .get(&sandbox.uid)
+                .filter(|s| s.workload_uid.as_ref() == Some(&wl.uid)),
+            // Connections opened before discovery also pick up the Workload's policies.
+            None => state.sandboxes.get_by_workload(&wl.uid).first().cloned(),
+        };
+        if let Some(sandbox) = &sandbox
+            && matches!(
+                traffic_policy::assert_tcp(&sandbox.traffic_policies, conn)?,
+                RbacDecision::Allow
+            )
+        {
+            // Match Workload TrafficPolicy: an explicit ALLOW ends authorization.
+            return Ok(());
+        }
 
         // We can get policies from namespace, global, and workload...
         let ns = state.policies.get_by_namespace(&wl.namespace);
@@ -559,6 +595,11 @@ impl DemandProxyState {
             .chain(workload)
             .filter_map(|k| {
                 let pol = state.policies.get(k)?;
+                // Sandbox replaces legacy Agentio TrafficPolicy. Istio policies are
+                // consulted only when this direction has no native TrafficPolicy.
+                if sandbox.is_some() && pol.priority.is_some() {
+                    return None;
+                }
                 // Filter by direction: inbound skips server-mode, outbound skips client-mode
                 let skip = match (ctx.conn.direction, pol.mode) {
                     (Direction::Inbound, TrafficPolicyMode::Client) => true,
@@ -1140,12 +1181,16 @@ impl ProxyStateManager {
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
-            Some(
-                xds::Config::new(config.clone(), tls_client_fetcher)
-                    .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
-                    .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater)
-                    .build(xds_metrics, awaiting_ready),
-            )
+            let mut builder = xds::Config::new(config.clone(), tls_client_fetcher)
+                .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
+                .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater.clone());
+            if config.enable_sandbox_manager {
+                builder = builder.with_optional_watched_handler::<xds::agentio::sandbox::Sandbox>(
+                    xds::SANDBOX_TYPE,
+                    updater,
+                );
+            }
+            Some(builder.build(xds_metrics, awaiting_ready))
         } else {
             None
         };
@@ -1198,6 +1243,28 @@ mod tests {
 
     use crate::{strng, test_helpers};
     use test_case::test_case;
+
+    #[tokio::test]
+    async fn sandbox_discovery_allows_shared_startup_without_workload_or_xds_address() {
+        let mut config = test_helpers::test_config();
+        config.enable_sandbox_manager = true;
+        config.proxy_mode = config::ProxyMode::Shared;
+        config.proxy_workload_information = None;
+        config.local_node = None;
+        config.xds_address = None;
+        config.local_xds_config = None;
+        let mut registry = Registry::default();
+        let state_manager = ProxyStateManager::new(
+            Arc::new(config),
+            xds::Metrics::new(&mut registry),
+            Arc::new(proxy::Metrics::new(&mut registry)),
+            tokio::sync::watch::channel(()).0,
+            crate::identity::mock::new_secret_manager(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        assert!(!state_manager.state().supports_on_demand());
+    }
 
     #[tokio::test]
     async fn test_wait_for_workload() {
@@ -1489,6 +1556,7 @@ mod tests {
         let key: Strng = format!("{dest_uid}").into();
         let workload = &state.read().workloads.by_uid[&key];
         crate::state::ProxyRbacContext {
+            sandbox: None,
             conn: rbac::Connection {
                 src_identity: Some(Identity::Spiffe {
                     trust_domain: "cluster.local".into(),
