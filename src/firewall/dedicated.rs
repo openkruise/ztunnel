@@ -79,10 +79,12 @@ impl FirewallController {
         }
     }
 
-    fn resolve_and_build(&self) -> Option<(crate::firewall::RuleSet, u64)> {
+    fn resolve_and_build(
+        &self,
+        applied_hash: Option<u64>,
+    ) -> Option<(crate::firewall::RuleSet, u64)> {
         let state = self.state.read();
-        let (policies, hash) = convert::resolve_workload_policies(&state, &self.workload_info)?;
-        Some((convert::build_firewall_ruleset(policies), hash))
+        convert::resolve_workload_firewall(&state, &self.workload_info, applied_hash)
     }
 
     async fn drain_cleanup(&self) {
@@ -98,19 +100,19 @@ impl FirewallController {
             return;
         }
 
-        let mut last_policy_hash: u64 = 0;
-        if let Some((ruleset, policy_hash)) = self.resolve_and_build() {
+        // Subscribe before the initial apply so updates during it are not lost.
+        let mut policies_changed = self.state.read().policies.subscribe();
+        let mut last_policy_hash = None;
+        if let Some((ruleset, policy_hash)) = self.resolve_and_build(last_policy_hash) {
             let start = Instant::now();
             let result = self.backend.apply(&ruleset).await;
             self.metrics
                 .record_apply(result.is_ok(), start.elapsed().as_secs_f64());
             match result {
-                Ok(()) => last_policy_hash = policy_hash,
+                Ok(()) => last_policy_hash = Some(policy_hash),
                 Err(e) => error!("Failed to apply initial firewall rules: {}", e),
             }
         }
-
-        let mut policies_changed = self.state.read().policies.subscribe();
 
         loop {
             tokio::select! {
@@ -142,12 +144,9 @@ impl FirewallController {
                         }
                     }
                     let rebuild_start = Instant::now();
-                    let Some((ruleset, policy_hash)) = self.resolve_and_build() else {
+                    let Some((ruleset, policy_hash)) = self.resolve_and_build(last_policy_hash) else {
                         continue;
                     };
-                    if policy_hash == last_policy_hash {
-                        continue;
-                    }
                     info!("Firewall policies changed, applying {} rules", ruleset.rules.len());
                     let start = Instant::now();
                     let result = self.backend.apply(&ruleset).await;
@@ -157,7 +156,7 @@ impl FirewallController {
                         .rebuild_duration
                         .observe(rebuild_start.elapsed().as_secs_f64());
                     match result {
-                        Ok(()) => last_policy_hash = policy_hash,
+                        Ok(()) => last_policy_hash = Some(policy_hash),
                         Err(e) => error!("Failed to apply firewall rules: {}", e),
                     }
                 }

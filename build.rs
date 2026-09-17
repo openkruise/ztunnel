@@ -25,10 +25,12 @@ fn main() -> Result<(), anyhow::Error> {
     let proto_files = [
         "proto/xds.proto",
         "proto/workload.proto",
-        "proto/authorization.proto",
         "proto/citadel.proto",
         "proto/zds.proto",
         "proto/extensions.proto",
+        "proto/api/sandbox/v1/sandbox.proto",
+        "proto/api/sandbox/v1/egressrouting.proto",
+        "proto/api/security/v1/trafficpolicy.proto",
     ]
     .iter()
     .map(|name| std::env::current_dir().unwrap().join(name))
@@ -45,7 +47,6 @@ fn main() -> Result<(), anyhow::Error> {
             ".istio.workload.Service",
             ".istio.workload.GatewayAddress",
             ".istio.workload.Address",
-            ".istio.security.Address",
         ]);
         c
     };

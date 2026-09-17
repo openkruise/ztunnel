@@ -15,26 +15,23 @@
 use crate::state::workload::GatewayAddress;
 use crate::state::workload::{NamespacedHostname, gatewayaddress};
 use crate::strng::Strng;
-use crate::xds::istio::security::Extension;
-use crate::xds::istio::workload::Extension as WorkloadExtension;
+use crate::xds::agentio::sandbox::{EgressRouting, egress_routing};
+use crate::xds::istio::workload::Extension as XdsWorkloadExtension;
 use crate::xds::kruise::networking::extensions::v1 as proto;
 use crate::xds::kruise::networking::extensions::v1::{
-    EgressPolicies as ProtoEgressPolicies, TrafficPolicyExtension, WorkloadMetadata,
+    EgressPolicies as ProtoEgressPolicies, WorkloadMetadata,
 };
 use ipnet::IpNet;
 use prost::Message;
 use std::collections::HashSet;
 use tracing::debug;
 
-const TRAFFIC_POLICY_TYPE_URL: &str =
-    "type.googleapis.com/kruise.networking.extensions.v1.TrafficPolicyExtension";
-
 const WORKLOAD_METADATA_TYPE_URL: &str =
     "type.googleapis.com/kruise.networking.extensions.v1.WorkloadMetadata";
 const DEFAULT_EGRESS_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/kruise.networking.extensions.v1.EgressPolicies";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum EgressPolicyAction {
     Passthrough,
     Deny,
@@ -55,15 +52,20 @@ pub enum EgressPolicyError {
     InvalidGatewayPort(u32),
     #[error("gateway action requires a gateway")]
     MissingGateway,
+    #[error("passthrough action must not specify a gateway")]
+    UnexpectedGateway,
     #[error("failed to decode egress policies: {0}")]
     Decode(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressPolicy {
+    #[serde(default)]
     pub namespaces: HashSet<String>,
+    #[serde(default)]
     pub match_cidrs: Vec<IpNet>,
+    #[serde(default)]
     pub match_ports: Vec<u16>,
     pub policy: EgressPolicyAction,
     pub gateway: Option<GatewayAddress>,
@@ -87,9 +89,10 @@ impl std::hash::Hash for EgressPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressPolicies {
+    #[serde(default)]
     pub policies: Vec<EgressPolicy>,
 }
 
@@ -103,9 +106,8 @@ impl std::hash::Hash for EgressPolicies {
 }
 
 #[derive(Debug, Clone)]
-pub enum AuthExtension {
+pub enum WorkloadExtension {
     WorkloadMetadata(WorkloadMetadata),
-    TrafficPolicy(TrafficPolicyExtension),
     EgressPolicies(EgressPolicies),
     Raw(RawExtension),
 }
@@ -117,65 +119,30 @@ pub struct RawExtension {
     pub config_raw: Option<Vec<u8>>,
 }
 
-impl TryFrom<WorkloadExtension> for AuthExtension {
+impl TryFrom<XdsWorkloadExtension> for WorkloadExtension {
     type Error = EgressPolicyError;
 
-    fn try_from(value: WorkloadExtension) -> Result<Self, Self::Error> {
+    fn try_from(value: XdsWorkloadExtension) -> Result<Self, Self::Error> {
         if let Some(any) = &value.config {
             match any.type_url.as_str() {
                 WORKLOAD_METADATA_TYPE_URL => {
                     if let Ok(metadata) = WorkloadMetadata::decode(&*any.value) {
                         debug!("Decoded workload metadata extension: {:?}", metadata);
-                        return Ok(AuthExtension::WorkloadMetadata(metadata));
+                        return Ok(WorkloadExtension::WorkloadMetadata(metadata));
                     }
                 }
                 DEFAULT_EGRESS_POLICIES_TYPE_URL => {
                     let policies = ProtoEgressPolicies::decode(&*any.value)
                         .map_err(|err| EgressPolicyError::Decode(err.to_string()))?;
                     debug!("Decoded egress policies extension: {:?}", policies);
-                    return Ok(AuthExtension::EgressPolicies(EgressPolicies::try_from(
+                    return Ok(WorkloadExtension::EgressPolicies(EgressPolicies::try_from(
                         policies,
                     )?));
                 }
                 _ => {}
             }
         }
-        Ok(AuthExtension::Raw(RawExtension::from(value)))
-    }
-}
-
-impl From<Extension> for AuthExtension {
-    fn from(ext: Extension) -> Self {
-        if let Some(any) = &ext.config {
-            match any.type_url.as_str() {
-                TRAFFIC_POLICY_TYPE_URL => {
-                    if let Ok(traffic_ext) = TrafficPolicyExtension::decode(&*any.value) {
-                        debug!(
-                            "Decoded traffic policy extension, policy: {:?}",
-                            traffic_ext
-                        );
-                        return AuthExtension::TrafficPolicy(traffic_ext);
-                    }
-                }
-                _ => {}
-            }
-        }
-        AuthExtension::Raw(RawExtension::from(ext))
-    }
-}
-
-impl From<Extension> for RawExtension {
-    fn from(ext: Extension) -> Self {
-        let (config_type_url, config_raw) = match ext.config {
-            Some(any) => (Some(any.type_url), Some(any.value)),
-            None => (None, None),
-        };
-
-        RawExtension {
-            name: ext.name,
-            config_type_url,
-            config_raw,
-        }
+        Ok(WorkloadExtension::Raw(RawExtension::from(value)))
     }
 }
 
@@ -199,8 +166,8 @@ impl WorkloadMetadata {
     }
 }
 
-impl From<WorkloadExtension> for RawExtension {
-    fn from(ext: WorkloadExtension) -> Self {
+impl From<XdsWorkloadExtension> for RawExtension {
+    fn from(ext: XdsWorkloadExtension) -> Self {
         let (config_type_url, config_raw) = match ext.config {
             Some(any) => (Some(any.type_url), Some(any.value)),
             None => (None, None),
@@ -232,26 +199,12 @@ impl TryFrom<proto::EgressPolicy> for EgressPolicy {
 
     fn try_from(value: proto::EgressPolicy) -> Result<Self, Self::Error> {
         let policy = EgressPolicyAction::try_from(value.policy)?;
-        let match_cidrs = value
-            .match_cidrs
-            .into_iter()
-            .map(|cidr| {
-                cidr.parse::<IpNet>()
-                    .map_err(|_| EgressPolicyError::InvalidCidr(cidr))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let match_ports = value
-            .match_ports
-            .into_iter()
-            .map(|port| {
-                port.parse::<u16>()
-                    .map_err(|_| EgressPolicyError::InvalidPort(port))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let match_cidrs = parse_cidrs(value.match_cidrs)?;
+        let match_ports = parse_ports(value.match_ports)?;
         let gateway = value
             .gateway
             .as_ref()
-            .map(proto_gateway_to_gateway)
+            .map(|gateway| parse_gateway_address(&gateway.service, gateway.port))
             .transpose()?;
         if policy == EgressPolicyAction::Gateway && gateway.is_none() {
             return Err(EgressPolicyError::MissingGateway);
@@ -281,22 +234,103 @@ impl TryFrom<proto::EgressPolicies> for EgressPolicies {
     }
 }
 
-/// Convert a proto GatewayAddress into the internal type.
+impl TryFrom<egress_routing::Route> for EgressPolicy {
+    type Error = EgressPolicyError;
+
+    fn try_from(value: egress_routing::Route) -> Result<Self, Self::Error> {
+        // Sandbox GATEWAY is 1; the legacy Workload action with that value is DENY.
+        let policy = match egress_routing::Action::try_from(value.action) {
+            Ok(egress_routing::Action::Passthrough) => EgressPolicyAction::Passthrough,
+            Ok(egress_routing::Action::Gateway) => EgressPolicyAction::Gateway,
+            Err(_) => return Err(EgressPolicyError::UnknownAction(value.action)),
+        };
+        let match_cidrs = parse_cidrs(value.match_cidrs)?;
+        let match_ports = parse_ports(value.match_ports)?;
+        let gateway = value
+            .gateway
+            .as_ref()
+            .map(|gateway| parse_gateway_address(&gateway.service, gateway.port))
+            .transpose()?;
+        let route = Self {
+            namespaces: HashSet::new(),
+            match_cidrs,
+            match_ports,
+            policy,
+            gateway,
+        };
+        route.validate_route()?;
+        Ok(route)
+    }
+}
+
+impl EgressPolicy {
+    pub(crate) fn validate_route(&self) -> Result<(), EgressPolicyError> {
+        if self.match_ports.contains(&0) {
+            return Err(EgressPolicyError::InvalidPort("0".into()));
+        }
+        if let Some(gateway) = &self.gateway
+            && gateway.hbone_mtls_port == 0
+        {
+            return Err(EgressPolicyError::InvalidGatewayPort(0));
+        }
+        match (self.policy, self.gateway.is_some()) {
+            (EgressPolicyAction::Gateway, false) => return Err(EgressPolicyError::MissingGateway),
+            (EgressPolicyAction::Passthrough, true) => {
+                return Err(EgressPolicyError::UnexpectedGateway);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<EgressRouting> for EgressPolicies {
+    type Error = EgressPolicyError;
+
+    fn try_from(value: EgressRouting) -> Result<Self, Self::Error> {
+        Ok(Self {
+            policies: value
+                .routes
+                .into_iter()
+                .map(EgressPolicy::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+fn parse_cidrs(cidrs: Vec<String>) -> Result<Vec<IpNet>, EgressPolicyError> {
+    cidrs
+        .into_iter()
+        .map(|cidr| {
+            cidr.parse::<IpNet>()
+                .map_err(|_| EgressPolicyError::InvalidCidr(cidr))
+        })
+        .collect()
+}
+
+fn parse_ports(ports: Vec<String>) -> Result<Vec<u16>, EgressPolicyError> {
+    ports
+        .into_iter()
+        .map(|port| {
+            port.parse::<u16>()
+                .map_err(|_| EgressPolicyError::InvalidPort(port))
+        })
+        .collect()
+}
+
+/// Convert gateway fields shared by both wire formats into the internal type.
 /// The service field is expected as a FQDN like `name.namespace.svc.cluster.local`;
 /// the second dot-separated segment is taken as the namespace. Invalid service
 /// names and out-of-range ports reject the containing resource.
 /// Port `0` is normalized to the HBONE MTLS default (15008).
-fn proto_gateway_to_gateway(
-    proto_gw: &proto::GatewayAddress,
-) -> Result<GatewayAddress, EgressPolicyError> {
-    let svc = proto_gw.service.clone();
+fn parse_gateway_address(svc: &str, port: u32) -> Result<GatewayAddress, EgressPolicyError> {
     let mut segments = svc.split('.');
     let service = segments.next().unwrap_or_default();
     let namespace = segments.next().unwrap_or_default();
     if service.is_empty() || namespace.is_empty() {
-        return Err(EgressPolicyError::InvalidGatewayService(svc));
+        return Err(EgressPolicyError::InvalidGatewayService(svc.into()));
     }
-    let port = match proto_gw.port {
+    let port = match port {
         0 => 15008,
         p => u16::try_from(p).map_err(|_| EgressPolicyError::InvalidGatewayPort(p))?,
     };
@@ -321,10 +355,6 @@ mod tests {
         const PREFIX: &str = "type.googleapis.com/kruise.networking.extensions.v1.";
 
         assert_eq!(
-            TRAFFIC_POLICY_TYPE_URL,
-            format!("{PREFIX}TrafficPolicyExtension")
-        );
-        assert_eq!(
             WORKLOAD_METADATA_TYPE_URL,
             format!("{PREFIX}WorkloadMetadata")
         );
@@ -338,7 +368,7 @@ mod tests {
 
     fn any_of<M: Message>(type_url: &str, msg: &M) -> Any {
         // Build a google.protobuf.Any payload for a known proto message; used
-        // to drive the type_url dispatch in From<Extension> / From<WorkloadExtension>.
+        // to drive the type_url dispatch in TryFrom<XdsWorkloadExtension>.
         let mut buf = Vec::with_capacity(msg.encoded_len());
         msg.encode(&mut buf).expect("encode");
         Any {
@@ -347,15 +377,8 @@ mod tests {
         }
     }
 
-    fn workload_ext(name: &str, any: Option<Any>) -> WorkloadExtension {
-        WorkloadExtension {
-            name: name.to_string(),
-            config: any,
-        }
-    }
-
-    fn security_ext(name: &str, any: Option<Any>) -> Extension {
-        Extension {
+    fn workload_ext(name: &str, any: Option<Any>) -> XdsWorkloadExtension {
+        XdsWorkloadExtension {
             name: name.to_string(),
             config: any,
         }
@@ -385,7 +408,7 @@ mod tests {
         assert!(EgressPolicyAction::try_from(-1).is_err());
     }
 
-    // ---- proto_gateway_to_gateway --------------------------------------
+    // ---- parse_gateway_address --------------------------------------
 
     #[test]
     fn gateway_extracts_namespace_from_fqdn() {
@@ -393,7 +416,7 @@ mod tests {
             service: "egress.istio-system.svc.cluster.local".to_string(),
             port: 8443,
         };
-        let out = proto_gateway_to_gateway(&gw).expect("should parse");
+        let out = parse_gateway_address(&gw.service, gw.port).expect("should parse");
         match out.destination {
             gatewayaddress::Destination::Hostname(h) => {
                 assert_eq!(h.namespace.as_str(), "istio-system");
@@ -411,7 +434,7 @@ mod tests {
             service: "egress.istio-system".to_string(),
             port: 0,
         };
-        let out = proto_gateway_to_gateway(&gw).expect("should parse");
+        let out = parse_gateway_address(&gw.service, gw.port).expect("should parse");
         assert_eq!(out.hbone_mtls_port, 15008);
     }
 
@@ -421,7 +444,7 @@ mod tests {
             service: "no-dots-here".to_string(),
             port: 0,
         };
-        assert!(proto_gateway_to_gateway(&gw).is_err());
+        assert!(parse_gateway_address(&gw.service, gw.port).is_err());
     }
 
     #[test]
@@ -430,7 +453,7 @@ mod tests {
             service: "foo.".to_string(),
             port: 1234,
         };
-        assert!(proto_gateway_to_gateway(&gw).is_err());
+        assert!(parse_gateway_address(&gw.service, gw.port).is_err());
     }
 
     // ---- EgressPolicy::try_from ----------------------------------------
@@ -528,6 +551,95 @@ mod tests {
         assert!(EgressPolicies::try_from(pp).is_err());
     }
 
+    #[test]
+    fn sandbox_egress_routing_reuses_workload_policy_types() {
+        let routing = EgressPolicies::try_from(EgressRouting {
+            routes: vec![
+                egress_routing::Route {
+                    action: egress_routing::Action::Gateway.into(),
+                    match_cidrs: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
+                    match_ports: vec!["80".into(), "443".into()],
+                    gateway: Some(egress_routing::GatewayAddress {
+                        service: "egress.ns.svc.cluster.local".into(),
+                        port: 0,
+                    }),
+                },
+                egress_routing::Route::default(),
+            ],
+        })
+        .unwrap();
+        let legacy = EgressPolicy::try_from(ext_proto::EgressPolicy {
+            policy: 2,
+            match_cidrs: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
+            match_ports: vec!["80".into(), "443".into()],
+            gateway: Some(ext_proto::GatewayAddress {
+                service: "egress.ns.svc.cluster.local".into(),
+                port: 0,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(routing.policies[0], legacy);
+        assert_eq!(routing.policies[1].policy, EgressPolicyAction::Passthrough);
+    }
+
+    #[test]
+    fn invalid_sandbox_egress_routes_are_rejected() {
+        use egress_routing::{Action, GatewayAddress, Route};
+        for route in [
+            Route {
+                action: 2,
+                ..Default::default()
+            },
+            Route {
+                action: Action::Gateway.into(),
+                ..Default::default()
+            },
+            Route {
+                match_cidrs: vec!["invalid".into()],
+                ..Default::default()
+            },
+            Route {
+                match_ports: vec!["0".into()],
+                ..Default::default()
+            },
+            Route {
+                match_ports: vec!["65536".into()],
+                ..Default::default()
+            },
+            Route {
+                gateway: Some(GatewayAddress {
+                    service: "egress.ns".into(),
+                    port: 15008,
+                }),
+                ..Default::default()
+            },
+            Route {
+                action: Action::Gateway.into(),
+                gateway: Some(GatewayAddress {
+                    service: "invalid".into(),
+                    port: 15008,
+                }),
+                ..Default::default()
+            },
+            Route {
+                action: Action::Gateway.into(),
+                gateway: Some(GatewayAddress {
+                    service: "egress.ns".into(),
+                    port: 65536,
+                }),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                EgressPolicies::try_from(EgressRouting {
+                    routes: vec![Route::default(), route],
+                })
+                .is_err()
+            );
+        }
+    }
+
     // ---- WorkloadMetadata::encode_labels -------------------------------
 
     #[test]
@@ -576,10 +688,10 @@ mod tests {
         assert_eq!(ma.encode_labels(), "YT0xLGI9Mg==");
     }
 
-    // ---- WorkloadExtension -> AuthExtension ----------------------------
+    // ---- XdsWorkloadExtension -> WorkloadExtension ----------------------------
 
     #[test]
-    fn auth_extension_from_workload_metadata() {
+    fn workload_extension_metadata() {
         let mut labels = HashMap::new();
         labels.insert("env".to_string(), "prod".to_string());
         let meta = WorkloadMetadata {
@@ -589,8 +701,8 @@ mod tests {
         let any = any_of(WORKLOAD_METADATA_TYPE_URL, &meta);
         let ext = workload_ext("meta-ext", Some(any));
 
-        match AuthExtension::try_from(ext).unwrap() {
-            AuthExtension::WorkloadMetadata(m) => {
+        match WorkloadExtension::try_from(ext).unwrap() {
+            WorkloadExtension::WorkloadMetadata(m) => {
                 assert_eq!(m.labels.get("env"), Some(&"prod".to_string()));
             }
             other => panic!("expected WorkloadMetadata, got {:?}", other),
@@ -598,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_extension_from_workload_egress_policies() {
+    fn workload_extension_egress_policies() {
         let policies = ext_proto::EgressPolicies {
             egress_policies: vec![ext_proto::EgressPolicy {
                 policy: 1,
@@ -608,8 +720,8 @@ mod tests {
         let any = any_of(DEFAULT_EGRESS_POLICIES_TYPE_URL, &policies);
         let ext = workload_ext("eg-ext", Some(any));
 
-        match AuthExtension::try_from(ext).unwrap() {
-            AuthExtension::EgressPolicies(p) => {
+        match WorkloadExtension::try_from(ext).unwrap() {
+            WorkloadExtension::EgressPolicies(p) => {
                 assert_eq!(p.policies.len(), 1);
                 assert_eq!(p.policies[0].policy, EgressPolicyAction::Deny);
             }
@@ -618,15 +730,15 @@ mod tests {
     }
 
     #[test]
-    fn auth_extension_from_workload_unknown_type_url_falls_back_to_raw() {
+    fn workload_extension_unknown_type_url_falls_back_to_raw() {
         let any = Any {
             type_url: "type.googleapis.com/unknown.Thing".to_string(),
             value: vec![1, 2, 3],
         };
         let ext = workload_ext("unk", Some(any));
 
-        match AuthExtension::try_from(ext).unwrap() {
-            AuthExtension::Raw(r) => {
+        match WorkloadExtension::try_from(ext).unwrap() {
+            WorkloadExtension::Raw(r) => {
                 assert_eq!(r.name, "unk");
                 assert_eq!(
                     r.config_type_url.as_deref(),
@@ -639,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_extension_from_workload_metadata_with_corrupt_bytes_falls_back_to_raw() {
+    fn workload_extension_metadata_with_corrupt_bytes_falls_back_to_raw() {
         // Right type_url, wrong bytes -> decode fails, we keep payload as Raw
         // so an operator can still inspect the malformed config.
         let any = Any {
@@ -648,88 +760,21 @@ mod tests {
         };
         let ext = workload_ext("bad-meta", Some(any));
         assert!(matches!(
-            AuthExtension::try_from(ext).unwrap(),
-            AuthExtension::Raw(_)
+            WorkloadExtension::try_from(ext).unwrap(),
+            WorkloadExtension::Raw(_)
         ));
     }
 
     #[test]
-    fn auth_extension_from_workload_without_config_is_raw_with_none_fields() {
+    fn workload_extension_without_config_is_raw_with_none_fields() {
         let ext = workload_ext("nocfg", None);
-        match AuthExtension::try_from(ext).unwrap() {
-            AuthExtension::Raw(r) => {
+        match WorkloadExtension::try_from(ext).unwrap() {
+            WorkloadExtension::Raw(r) => {
                 assert_eq!(r.name, "nocfg");
                 assert!(r.config_type_url.is_none());
                 assert!(r.config_raw.is_none());
             }
             other => panic!("expected Raw, got {:?}", other),
         }
-    }
-
-    // ---- security::Extension -> AuthExtension --------------------------
-
-    #[test]
-    fn auth_extension_from_security_traffic_policy() {
-        let tp = TrafficPolicyExtension {
-            priority: 42,
-            mode: 1, // Client
-        };
-        let any = any_of(TRAFFIC_POLICY_TYPE_URL, &tp);
-        let ext = security_ext("tp", Some(any));
-
-        match AuthExtension::from(ext) {
-            AuthExtension::TrafficPolicy(t) => {
-                assert_eq!(t.priority, 42);
-                assert_eq!(t.mode, 1);
-            }
-            other => panic!("expected TrafficPolicy, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn auth_extension_from_security_unknown_type_url_falls_back_to_raw() {
-        let any = Any {
-            type_url: "type.googleapis.com/other.Thing".to_string(),
-            value: vec![],
-        };
-        let ext = security_ext("other", Some(any));
-        assert!(matches!(AuthExtension::from(ext), AuthExtension::Raw(_)));
-    }
-
-    #[test]
-    fn auth_extension_from_security_corrupt_traffic_policy_falls_back_to_raw() {
-        let any = Any {
-            type_url: TRAFFIC_POLICY_TYPE_URL.to_string(),
-            value: vec![0xff, 0xff],
-        };
-        let ext = security_ext("corrupt", Some(any));
-        assert!(matches!(AuthExtension::from(ext), AuthExtension::Raw(_)));
-    }
-
-    #[test]
-    fn auth_extension_from_security_without_config_is_raw_with_none_fields() {
-        let ext = security_ext("nocfg", None);
-        match AuthExtension::from(ext) {
-            AuthExtension::Raw(r) => {
-                assert_eq!(r.name, "nocfg");
-                assert!(r.config_type_url.is_none());
-                assert!(r.config_raw.is_none());
-            }
-            other => panic!("expected Raw, got {:?}", other),
-        }
-    }
-
-    // ---- RawExtension::From --------------------------------------------
-
-    #[test]
-    fn raw_extension_from_security_extension_with_config_keeps_fields() {
-        let any = Any {
-            type_url: "tu".to_string(),
-            value: vec![9, 9, 9],
-        };
-        let r: RawExtension = security_ext("name1", Some(any)).into();
-        assert_eq!(r.name, "name1");
-        assert_eq!(r.config_type_url.as_deref(), Some("tu"));
-        assert_eq!(r.config_raw.as_deref(), Some(&[9u8, 9, 9][..]));
     }
 }
