@@ -513,63 +513,40 @@ impl DemandProxyState {
         &self,
         ctx: &ProxyRbacContext,
     ) -> Result<(), proxy::AuthorizationRejectionError> {
-        let conn = &ctx.conn;
         let state = self.read();
-        // Rechecks resolve the current Sandbox binding and policies.
-        let workload_uid = &ctx.workload.uid;
+        let denied = |name: &str| {
+            proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                name.into(),
+                "binding-unavailable".into(),
+            )
+        };
+        // Existing connections must use the current Workload binding, not their cached Arc.
+        let workload = state
+            .workloads
+            .find_uid(&ctx.workload.uid)
+            .ok_or_else(|| denied(&ctx.workload.uid))?;
         let sandbox = match &ctx.sandbox {
-            Some(sandbox) => state
-                .sandboxes
-                .get(&sandbox.uid)
-                .filter(|s| s.workload_uid.as_ref() == Some(workload_uid)),
-            // Connections opened before discovery also use the current binding.
+            Some(selected) => Some(
+                state
+                    .sandboxes
+                    .get(&selected.uid)
+                    .filter(|sandbox| sandbox.workload_uid.as_ref() == Some(&workload.uid))
+                    .ok_or_else(|| denied(&selected.uid))?,
+            ),
             None => state
                 .sandboxes
-                .get_by_workload(workload_uid)
+                .get_by_workload(&workload.uid)
                 .first()
                 .cloned(),
         };
-        let Some(sandbox) = sandbox else {
-            return Ok(());
-        };
-        let mut configured = false;
-        for (name, policy) in sandbox.traffic_policies(&state.policies) {
-            let policy = policy.ok_or_else(|| {
-                proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                    name.into(),
-                    "policy-unavailable".into(),
-                )
-            })?;
-            let Some(rules) = policy.rules_for(conn.direction) else {
-                continue;
-            };
-            configured = true;
-            match rules.match_tcp(conn) {
-                Some((index, rbac::Action::Allow)) => {
-                    debug!(
-                        policy = name,
-                        rule = index,
-                        "TrafficPolicy allowed connection"
-                    );
-                    return Ok(());
-                }
-                Some((index, rbac::Action::Deny)) => {
-                    return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                        name.into(),
-                        format!("rule-{index}").into(),
-                    ));
-                }
-                None => continue,
-            }
+        if let Some(inline) = sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.traffic_policy.as_ref())
+        {
+            rbac::assert_policies(std::iter::once(("inline", Some(inline))), &ctx.conn)?;
         }
-        if configured {
-            Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                strng::EMPTY,
-                "DEFAULT-DENY".into(),
-            ))
-        } else {
-            Ok(())
-        }
+        // An inline ALLOW passes only the Sandbox stage; Workload policies still apply.
+        rbac::assert_policies(workload.traffic_policies(&state.policies), &ctx.conn)
     }
 
     // Select a workload IP, with DNS resolution if needed
@@ -852,13 +829,18 @@ impl ProxyStateManager {
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
-            let builder = xds::Config::new(config.clone(), tls_client_fetcher)
+            let mut builder = xds::Config::new(config.clone(), tls_client_fetcher)
                 .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
                 .with_watched_handler::<xds::agentio::security::TrafficPolicy>(
                     xds::TRAFFIC_POLICY_TYPE,
                     updater.clone(),
-                )
-                .with_watched_handler::<xds::agentio::sandbox::Sandbox>(xds::SANDBOX_TYPE, updater);
+                );
+            if config.sandbox_mode {
+                builder = builder.with_watched_handler::<xds::agentio::sandbox::Sandbox>(
+                    xds::SANDBOX_TYPE,
+                    updater,
+                );
+            }
             Some(builder.build(xds_metrics, awaiting_ready))
         } else {
             None
@@ -915,6 +897,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_discovery_allows_shared_startup_without_workload_or_xds_address() {
         let mut config = test_helpers::test_config();
+        config.sandbox_mode = true;
         config.enable_sandbox_manager = true;
         config.proxy_mode = config::ProxyMode::Shared;
         config.proxy_workload_information = None;
