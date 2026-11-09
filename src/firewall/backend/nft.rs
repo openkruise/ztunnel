@@ -165,23 +165,6 @@ impl NftBackend {
             outbound_lines.extend(rendered.lines);
         }
 
-        let mut inline_input = Vec::new();
-        let mut inline_output = Vec::new();
-        let mut inline = ruleset.inline_rules.iter().collect::<Vec<_>>();
-        inline.sort_by_key(|rule| rule.priority);
-        for rule in inline {
-            let action = match rule.action {
-                RuleAction::Allow => "return",
-                RuleAction::Deny => "reject",
-            };
-            let rendered = Self::render_rule_with_action(rule, &mut set_counter, action);
-            all_sets.extend(rendered.sets);
-            match rule.direction {
-                Direction::Inbound => inline_input.extend(rendered.lines),
-                Direction::Outbound => inline_output.extend(rendered.lines),
-            }
-        }
-
         // Build the nft script
         let mut script = String::new();
 
@@ -203,28 +186,12 @@ impl NftBackend {
             script.push_str("  }\n");
         }
 
-        if !ruleset.inline_rules.is_empty() {
-            for (name, lines) in [
-                ("zt_inline_input", &inline_input),
-                ("zt_inline_output", &inline_output),
-            ] {
-                script.push_str(&format!("  chain {name} {{\n"));
-                for line in lines {
-                    script.push_str(&format!("    {line}\n"));
-                }
-                script.push_str("  }\n");
-            }
-        }
-
         // Policy chains (type filter, priority -150)
         script.push_str("  chain zt_policy_input {\n");
         script.push_str("    type filter hook input priority -150; policy accept;\n");
         script.push_str("    ct state established,related accept\n");
         script.push_str("    iif lo accept\n");
 
-        if !ruleset.inline_rules.is_empty() {
-            script.push_str("    meta l4proto != tcp jump zt_inline_input\n");
-        }
         for line in &inbound_lines {
             script.push_str(&format!("    {}\n", line));
         }
@@ -246,9 +213,6 @@ impl NftBackend {
             script.push_str("    meta skgid 1337 return\n");
         }
 
-        if !ruleset.inline_rules.is_empty() {
-            script.push_str("    meta l4proto != tcp jump zt_inline_output\n");
-        }
         for line in &outbound_lines {
             script.push_str(&format!("    {}\n", line));
         }
@@ -277,14 +241,6 @@ impl NftBackend {
             RuleAction::Allow => "accept",
             RuleAction::Deny => "reject",
         };
-        Self::render_rule_with_action(rule, set_counter, action_str)
-    }
-
-    fn render_rule_with_action(
-        rule: &FirewallRule,
-        set_counter: &mut usize,
-        action_str: &str,
-    ) -> RenderedRule {
         let comment = format!("comment \"{}\"", escape_comment(&rule.name));
 
         // Expand clauses via cartesian product (same semantics as iptables),
@@ -1027,7 +983,6 @@ mod tests {
         );
         let script = NftBackend::new().render_ruleset(&RuleSet {
             rules: vec![rule],
-            inline_rules: Vec::new(),
             policy_attached: true,
         });
         assert_golden(&script, "dedicated_default_deny");
@@ -1095,7 +1050,6 @@ mod tests {
         );
         let ruleset = RuleSet {
             rules: vec![rule],
-            inline_rules: Vec::new(),
             policy_attached: true,
         };
         let script = inpod_backend().render_ruleset(&ruleset);
@@ -1125,7 +1079,6 @@ mod tests {
                     RuleAction::Allow,
                 ),
             ],
-            inline_rules: Vec::new(),
             policy_attached: true,
         };
         let script = inpod_backend().render_ruleset(&ruleset);
@@ -1478,7 +1431,6 @@ mod tests {
 
         let script = NftBackend::new().render_ruleset(&RuleSet {
             rules: vec![rule],
-            inline_rules: Vec::new(),
             policy_attached: true,
         });
 
@@ -1526,7 +1478,6 @@ mod tests {
 
         let script = NftBackend::new().render_ruleset(&RuleSet {
             rules: vec![rule1, rule2],
-            inline_rules: Vec::new(),
             policy_attached: true,
         });
 
@@ -1604,7 +1555,6 @@ mod tests {
 
         let script = NftBackend::new().render_ruleset(&RuleSet {
             rules: vec![rule1, rule2, rule3],
-            inline_rules: Vec::new(),
             policy_attached: true,
         });
 
@@ -1848,7 +1798,6 @@ mod tests {
                 .prop_map(|(rules, policy_attached)| RuleSet {
                     rules,
                     policy_attached,
-                    inline_rules: Vec::new(),
                 })
         }
 

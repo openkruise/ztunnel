@@ -60,7 +60,7 @@ fn context(client: &LocalClient, port: u16) -> ProxyRbacContext {
 }
 
 #[tokio::test]
-async fn local_file_loads_sandbox_inline_and_shared_policies() {
+async fn local_file_loads_sandbox_bindings_and_workload_policies() {
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), CONFIG).unwrap();
     let client = client(ConfigSource::File(file.path().into()));
@@ -125,7 +125,7 @@ async fn local_reload_replaces_resources_and_keeps_policy_subscribers() {
             "rule-1".into()
         ))
     );
-    // Inline ALLOW still evaluates the Workload stage.
+    // Sandbox-bound Workloads still enforce their policy.
     assert!(state.assert_rbac(&context(&client, 8080)).await.is_err());
 
     config.policies.clear();
@@ -187,9 +187,9 @@ fn invalid_local_resources_preserve_the_previous_snapshot() {
     let before = serde_json::to_value(&*client.state.read().unwrap()).unwrap();
     for (name, change) in [
         (
-            "zero inline port",
+            "zero shared port",
             (|c: &mut serde_yaml::Value| {
-                c["sandboxes"][0]["trafficPolicy"]["egress"]["rules"][0]["ports"] =
+                c["policies"][POLICY]["egress"]["rules"][0]["ports"] =
                     serde_yaml::from_str("[{protocol: TCP, range: {start: 0, end: 80}}]").unwrap();
             }) as fn(&mut serde_yaml::Value),
         ),

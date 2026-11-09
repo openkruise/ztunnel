@@ -40,7 +40,6 @@ fn policy(egress: Option<Vec<proto::Rule>>) -> XdsTrafficPolicy {
 }
 
 async fn check_policies(
-    inline: Option<XdsTrafficPolicy>,
     policies: &[(&str, Option<&XdsTrafficPolicy>)],
     conn: &Connection,
 ) -> Result<(), AuthorizationRejectionError> {
@@ -72,7 +71,6 @@ async fn check_policies(
                     attester: Some(Attester {
                         workload_uid: f.workload.uid.to_string(),
                     }),
-                    traffic_policy: inline,
                     ..Default::default()
                 },
             })
@@ -98,69 +96,7 @@ async fn evaluate(
     policy: XdsTrafficPolicy,
     conn: &Connection,
 ) -> Result<(), AuthorizationRejectionError> {
-    check_policies(Some(policy), &[], conn).await
-}
-
-#[tokio::test]
-async fn sandbox_allow_continues_to_workload_policies() {
-    let conn = connection("10.1.0.1:1234", "192.0.2.1:443");
-    let allow = policy(Some(vec![rule(proto::Action::Allow)]));
-    let deny = policy(Some(vec![rule(proto::Action::Deny)]));
-    assert!(
-        check_policies(Some(allow.clone()), &[("system", Some(&deny))], &conn)
-            .await
-            .is_err()
-    );
-    assert!(
-        check_policies(Some(deny), &[("system", Some(&allow))], &conn)
-            .await
-            .is_err()
-    );
-    assert!(
-        check_policies(Some(allow.clone()), &[("system", Some(&allow))], &conn)
-            .await
-            .is_ok()
-    );
-    assert!(
-        check_policies(Some(allow), &[("missing", None)], &conn)
-            .await
-            .is_err()
-    );
-}
-
-#[test]
-fn sandbox_firewall_allow_returns_to_workload_stage() {
-    use crate::firewall::{IptBackend, NftBackend};
-    let allow = TrafficPolicy::try_from(policy(Some(vec![rule(proto::Action::Allow)]))).unwrap();
-    let deny = TrafficPolicy::try_from(policy(Some(vec![rule(proto::Action::Deny)]))).unwrap();
-    let mut rules = firewall_rulesets(std::iter::once(("system", Some(&deny))));
-    rules.inline_rules = firewall_rulesets(std::iter::once(("inline", Some(&allow)))).rules;
-    let ipt = IptBackend::new().render_ruleset(&rules);
-    let inline_allow = ipt
-        .lines()
-        .find(|line| line.starts_with("-A ISTIO_FW_INLINE_OUT ") && line.contains("-j RETURN"))
-        .unwrap();
-    assert!(inline_allow.starts_with("-A ISTIO_FW_INLINE_OUT "));
-    assert!(inline_allow.contains("-j RETURN"));
-    let system_deny = ipt
-        .lines()
-        .find(|line| line.starts_with("-A ISTIO_FW_FILTER_OUT ") && line.contains("-j REJECT"))
-        .unwrap();
-    assert!(system_deny.contains("-j REJECT"));
-    assert!(ipt.find("! -p tcp -j ISTIO_FW_INLINE_OUT").unwrap() < ipt.find(system_deny).unwrap());
-
-    let nft = NftBackend::new().render_ruleset(&rules);
-    let inline_allow = nft
-        .lines()
-        .find(|line| line.contains("inline/rule-0"))
-        .unwrap();
-    assert!(inline_allow.contains("return"));
-    let system_deny = nft
-        .lines()
-        .find(|line| line.contains("system/rule-0"))
-        .unwrap();
-    assert!(system_deny.contains("reject"));
-    assert!(nft.find("jump zt_inline_output").unwrap() < nft.find(system_deny).unwrap());
+    check_policies(&[("policy", Some(&policy))], conn).await
 }
 
 #[tokio::test]
@@ -185,7 +121,7 @@ async fn native_policy_order_and_direction_defaults() {
     assert_eq!(
         evaluate(policy(Some(vec![deny, allow.clone()])), &conn).await,
         Err(AuthorizationRejectionError::ExplicitlyDenied(
-            "inline".into(),
+            "policy".into(),
             "rule-0".into(),
         )),
     );
@@ -391,7 +327,6 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
             attester: Some(Attester {
                 workload_uid: f.workload.uid.to_string(),
             }),
-            traffic_policy: Some(policy(Some(vec![rule(proto::Action::Allow)]))),
             ..Default::default()
         },
     };
@@ -405,17 +340,13 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     assert!(state.assert_rbac(&ctx).await.is_ok());
     assert!(state.assert_rbac(&before_discovery).await.is_ok());
 
-    // Selected connections follow policy updates; unselected outbound connections stay on platform policy.
-    resource.resource.traffic_policy = Some(policy(Some(vec![rule(proto::Action::Deny)])));
+    // Replacing an identical binding keeps connection identity stable.
     f.state
         .write()
         .unwrap()
         .sandboxes
         .update(resource.clone())
         .unwrap();
-    assert!(state.assert_rbac(&ctx).await.is_err());
-    assert!(state.assert_rbac(&before_discovery).await.is_ok());
-
     // Keep connection tracking separate for different Sandbox identities, not policy versions.
     let mut updated = ctx.clone();
     updated.sandbox = f.demand.fetch_sandbox(&f.workload);
@@ -431,58 +362,20 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     let contexts = std::collections::HashSet::from([ctx.clone(), updated, other]);
     assert_eq!(contexts.len(), 2);
 
-    // Invalid policy + binding changes leave the accepted resource and binding intact.
+    // An invalid binding update must retain the accepted resource.
     let accepted = f.demand.fetch_sandbox(&f.workload).unwrap();
-    let mut invalid = resource.clone();
-    invalid.resource.attester.as_mut().unwrap().workload_uid = "different-workload".into();
-    invalid
+    resource
         .resource
-        .traffic_policy
+        .attester
         .as_mut()
         .unwrap()
-        .egress
-        .as_mut()
-        .unwrap()
-        .rules[0]
-        .r#match = None;
-    assert!(f.state.write().unwrap().sandboxes.update(invalid).is_err());
+        .workload_uid
+        .clear();
+    assert!(f.state.write().unwrap().sandboxes.update(resource).is_err());
     assert!(Arc::ptr_eq(
         &accepted,
         &f.demand.fetch_sandbox(&f.workload).unwrap()
     ));
-    assert!(state.assert_rbac(&ctx).await.is_err());
-
-    // A Sandbox with no native rules allows traffic.
-    f.publish("sandbox-a");
-    assert!(state.assert_rbac(&ctx).await.is_ok());
-
-    // Inbound selects ingress; egress ALLOW cannot override an ingress DENY.
-    resource.resource.traffic_policy = Some(XdsTrafficPolicy {
-        ingress: Some(proto::RuleSet {
-            rules: vec![rule(proto::Action::Deny)],
-        }),
-        ..policy(Some(vec![rule(proto::Action::Allow)]))
-    });
-    f.state
-        .write()
-        .unwrap()
-        .sandboxes
-        .update(resource.clone())
-        .unwrap();
-    assert!(state.assert_rbac(&ctx).await.is_ok());
-    ctx.conn.direction = Direction::Inbound;
-    assert!(state.assert_rbac(&ctx).await.is_err());
-    resource
-        .resource
-        .traffic_policy
-        .as_mut()
-        .unwrap()
-        .ingress
-        .as_mut()
-        .unwrap()
-        .rules[0]
-        .action = proto::Action::Allow.into();
-    f.state.write().unwrap().sandboxes.update(resource).unwrap();
     assert!(state.assert_rbac(&ctx).await.is_ok());
 
     // Missing Sandbox configuration falls back to Workload policies for existing connections.
@@ -502,25 +395,9 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     f.bind_policies(&[]);
     assert!(state.assert_rbac(&ctx).await.is_ok());
 
-    // Recovery reapplies inline policy only to connections that selected this Sandbox.
-    let recovered = XdsResource {
-        name: "sandbox-a".into(),
-        resource: Sandbox {
-            uid: "sandbox-a".into(),
-            attester: Some(Attester {
-                workload_uid: f.workload.uid.to_string(),
-            }),
-            traffic_policy: Some(policy(Some(vec![rule(proto::Action::Deny)]))),
-            ..Default::default()
-        },
-    };
-    f.state
-        .write()
-        .unwrap()
-        .sandboxes
-        .update(recovered)
-        .unwrap();
-    assert!(state.assert_rbac(&ctx).await.is_err());
+    // Rediscovery restores the binding without changing Workload policy decisions.
+    f.publish("sandbox-a");
+    assert!(state.assert_rbac(&ctx).await.is_ok());
     assert!(state.assert_rbac(&before_discovery).await.is_ok());
 
     // A known binding mismatch is not temporary unavailability.
@@ -641,91 +518,6 @@ fn native_firewall_rendering() {
 }
 
 #[test]
-fn native_firewall_resolution_tracks_policy_updates_and_removal() {
-    use crate::firewall::convert::resolve_workload_firewall;
-    use crate::sandbox::discovery::tests::Fixture;
-    use crate::state::WorkloadInfo;
-    use crate::xds::agentio::sandbox::{Sandbox, sandbox::Attester};
-    use crate::xds::{Handler, ProxyStateUpdater, XdsResource, XdsUpdate};
-
-    let f = Fixture::new();
-    let info = WorkloadInfo::new(
-        f.workload.name.to_string(),
-        f.workload.namespace.to_string(),
-        f.workload.service_account.to_string(),
-    );
-    let resolve = || resolve_workload_firewall(&f.state.read().unwrap(), &info, None).unwrap();
-    let initial = resolve();
-    assert_eq!(initial.0, crate::firewall::RuleSet::default());
-    let mut changed = f.state.read().unwrap().policies.subscribe();
-    let updater = ProxyStateUpdater::new_no_fetch(f.state.clone());
-    let mut resource = XdsResource {
-        name: "sandbox-a".into(),
-        resource: Sandbox {
-            uid: "sandbox-a".into(),
-            attester: Some(Attester {
-                workload_uid: f.workload.uid.to_string(),
-            }),
-            traffic_policy: Some(policy(Some(vec![rule(proto::Action::Deny)]))),
-            ..Default::default()
-        },
-    };
-    let publish =
-        |resource| updater.handle(Box::new(&mut std::iter::once(XdsUpdate::Update(resource))));
-    publish(resource.clone()).unwrap();
-    assert!(changed.has_changed().unwrap());
-    changed.borrow_and_update();
-    let deny = resolve();
-    assert_ne!(initial.1, deny.1);
-    assert_eq!(deny.0.inline_rules.len(), 2);
-    assert_eq!(
-        deny.0.inline_rules[0].action,
-        crate::firewall::RuleAction::Deny
-    );
-
-    resource
-        .resource
-        .traffic_policy
-        .as_mut()
-        .unwrap()
-        .egress
-        .as_mut()
-        .unwrap()
-        .rules[0]
-        .action = proto::Action::Allow.into();
-    publish(resource.clone()).unwrap();
-    let allow = resolve();
-    assert_ne!(deny.1, allow.1);
-    assert_eq!(
-        allow.0.inline_rules[0].action,
-        crate::firewall::RuleAction::Allow
-    );
-    changed.borrow_and_update();
-
-    resource
-        .resource
-        .traffic_policy
-        .as_mut()
-        .unwrap()
-        .egress
-        .as_mut()
-        .unwrap()
-        .rules[0]
-        .r#match = None;
-    assert!(publish(resource).is_err());
-    assert!(!changed.has_changed().unwrap());
-    assert_eq!(resolve(), allow);
-
-    updater
-        .handle(Box::new(&mut std::iter::once(
-            XdsUpdate::<Sandbox>::Remove("sandbox-a".into()),
-        )))
-        .unwrap();
-    assert!(changed.has_changed().unwrap());
-    assert_eq!(resolve(), initial);
-}
-
-#[test]
 fn native_firewall_preserves_order_and_direction_presence() {
     use crate::firewall::{Direction as FirewallDirection, IptBackend, NftBackend};
 
@@ -806,7 +598,7 @@ async fn shared_policy_chain_precedence_missing_and_direction_defaults() {
             .zip(chain)
             .map(|(name, policy)| (name.as_str(), policy))
             .collect();
-        check_policies(None, &policies, &conn).await
+        check_policies(&policies, &conn).await
     };
     assert_eq!(evaluate(vec![]).await, Ok(()));
     assert_eq!(evaluate(vec![Some(&absent)]).await, Ok(()));
@@ -1003,7 +795,7 @@ fn sandbox_notifications_ignore_identical_updates_and_handle_partial_batches() {
         !changes.has_changed().unwrap(),
         "identical updates must not recheck traffic policies"
     );
-    resource.resource.traffic_policy = Some(policy(Some(vec![rule(proto::Action::Deny)])));
+    resource.resource.attester.as_mut().unwrap().workload_uid = "replacement".into();
     publish(resource.clone()).unwrap();
     assert!(changes.has_changed().unwrap());
     changes.borrow_and_update();
@@ -1042,14 +834,14 @@ async fn shared_policy_diagnostics_keep_resource_name_and_local_rule_index() {
     let name = "namespaces/ns/trafficPolicies/deny-web";
     let deny = policy(Some(vec![rule(proto::Action::Deny)]));
     assert_eq!(
-        check_policies(None, &[(name, Some(&deny))], &conn).await,
+        check_policies(&[(name, Some(&deny))], &conn).await,
         Err(AuthorizationRejectionError::ExplicitlyDenied(
             name.into(),
             "rule-0".into(),
         )),
     );
     assert_eq!(
-        check_policies(None, &[(name, None)], &conn).await,
+        check_policies(&[(name, None)], &conn).await,
         Err(AuthorizationRejectionError::ExplicitlyDenied(
             name.into(),
             "policy-unavailable".into(),
@@ -1080,10 +872,15 @@ fn unchanged_firewall_hash_skips_build_with_and_without_sandbox() {
         let (_, hash) = resolve_workload_firewall(&guard, &info, None).unwrap();
         assert!(resolve_workload_firewall(&guard, &info, Some(hash)).is_none());
         assert!(resolve_workload_firewall(&guard, &info, Some(hash.wrapping_add(1))).is_some());
+        hash
     };
-    check();
+    let before = check();
     f.publish("a");
-    check();
+    assert_eq!(
+        check(),
+        before,
+        "Sandbox bindings do not change firewall rules"
+    );
 }
 
 #[tokio::test]

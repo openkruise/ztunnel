@@ -480,7 +480,6 @@ mod tests {
     use crate::strng;
     use crate::test_helpers::{get_response_str, helpers, new_proxy_state};
     use crate::xds::agentio::sandbox::{Sandbox as XdsSandbox, sandbox::Attester};
-    use crate::xds::agentio::security::{TrafficPolicy as XdsTrafficPolicy, traffic_policy};
     use crate::xds::istio::workload::GatewayAddress as XdsGatewayAddress;
     use crate::xds::istio::workload::LoadBalancing as XdsLoadBalancing;
     use crate::xds::istio::workload::Locality as XdsLocality;
@@ -782,26 +781,6 @@ mod tests {
             attester: Some(Attester {
                 workload_uid: wl.uid.clone(),
             }),
-            traffic_policy: Some(XdsTrafficPolicy {
-                egress: Some(traffic_policy::RuleSet {
-                    rules: vec![traffic_policy::Rule {
-                        action: traffic_policy::Action::Allow.into(),
-                        r#match: Some(traffic_policy::Match {
-                            source_ips: vec![traffic_policy::Address {
-                                address: vec![127, 0, 0, 2],
-                                length: 32,
-                            }],
-                            ports: vec![traffic_policy::PortMatch {
-                                protocol: traffic_policy::Protocol::Tcp.into(),
-                                port: Some(80),
-                                end_port: None,
-                            }],
-                            ..Default::default()
-                        }),
-                    }],
-                }),
-                ..Default::default()
-            }),
             ..Default::default()
         };
         let proxy_state = new_proxy_state(&[wl], &[svc], &[sandbox]);
@@ -841,10 +820,7 @@ mod tests {
         assert!(resp_str.contains("127.0.0.2"), "{resp_str}");
         let json: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(json["sandboxes"][0]["uid"], "workload:pod-uid");
-        assert_eq!(
-            json["sandboxes"][0]["trafficPolicy"]["egress"]["rules"][0]["ports"][0]["protocol"],
-            "TCP"
-        );
+        assert!(json["sandboxes"][0].get("trafficPolicy").is_none());
         assert!(json.get("policies").is_none());
         // Check a waypoint
         assert!(resp_str.contains(

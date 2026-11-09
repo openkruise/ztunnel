@@ -138,7 +138,6 @@ async fn restored_identity_waits_for_snapshot_and_checks_binding() {
     fixture.state.write().unwrap().sandboxes.insert(Sandbox {
         uid: "kruise:one".into(),
         workload_uid: Some(other.uid),
-        traffic_policy: None,
     });
     assert!(matches!(
         manager.ready_sandbox(),
