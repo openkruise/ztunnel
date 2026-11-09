@@ -142,8 +142,7 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
             .unwrap();
     }
     for id in ["sandbox-z", "sandbox-a"] {
-        let mut sandbox = resource(id, "workload-uid");
-        sandbox.resource.traffic_policy = Some(policy.clone());
+        let sandbox = resource(id, "workload-uid");
         state.sandboxes.update(sandbox).unwrap();
     }
 
@@ -162,7 +161,7 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
         "destinationIps": ["10.0.0.0/8"],
         "ports": [{"protocol": "TCP", "range": {"start": 80, "end": 90}}]
     });
-    assert_eq!(sandbox["trafficPolicy"]["egress"]["rules"][0], rule);
+    assert!(sandbox.get("trafficPolicy").is_none());
     assert_eq!(dump["trafficPolicies"][0]["egress"]["rules"][0], rule);
 
     state.sandboxes.remove(&"sandbox-a".into());

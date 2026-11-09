@@ -19,7 +19,7 @@ use crate::state::{ProxyState, WorkloadInfo};
 
 use super::types::RuleSet;
 
-/// Resolve native Workload policies and the selected Sandbox's inline gate.
+/// Resolve native Workload policies.
 /// Returns None when the Workload is missing or the applied policy hash is unchanged.
 pub fn resolve_workload_firewall(
     state: &ProxyState,
@@ -27,30 +27,15 @@ pub fn resolve_workload_firewall(
     applied_hash: Option<u64>,
 ) -> Option<(RuleSet, u64)> {
     let workload = state.workloads.find_by_info(info)?;
-    let sandbox = state
-        .sandboxes
-        .get_by_workload(&workload.uid)
-        .first()
-        .cloned();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workload.uid.hash(&mut hasher);
     for policy in workload.traffic_policies(&state.policies) {
         policy.hash(&mut hasher);
     }
-    sandbox
-        .as_ref()
-        .map(|sandbox| (&sandbox.uid, &sandbox.traffic_policy))
-        .hash(&mut hasher);
     let hash = hasher.finish();
     if applied_hash == Some(hash) {
         return None;
     }
-    let mut rules = firewall_rulesets(workload.traffic_policies(&state.policies));
-    if let Some(inline) = sandbox
-        .as_ref()
-        .and_then(|sandbox| sandbox.traffic_policy.as_ref())
-    {
-        rules.inline_rules = firewall_rulesets(std::iter::once(("inline", Some(inline)))).rules;
-    }
+    let rules = firewall_rulesets(workload.traffic_policies(&state.policies));
     Some((rules, hash))
 }

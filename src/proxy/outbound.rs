@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_policy_updates_recheck_tcp() {
+    async fn workload_policy_updates_recheck_tcp_with_sandbox() {
         use crate::sandbox::discovery::tests::Fixture;
         use crate::state::DemandProxyState;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1388,23 +1388,25 @@ mod tests {
             drop(next_client);
             drop(next_server);
             next_forwarding.await.unwrap();
-            // An accepted xDS policy update rechecks and closes the existing TCP stream.
-            publish(Sandbox {
-                uid: "sandbox-a".into(),
-                attester: Some(Attester {
-                    workload_uid: fixture.workload.uid.to_string(),
-                }),
-                traffic_policy: Some(TrafficPolicy {
-                    egress: Some(traffic_policy::RuleSet {
-                        rules: vec![traffic_policy::Rule {
-                            action: traffic_policy::Action::Deny.into(),
-                            r#match: Some(traffic_policy::Match::default()),
-                        }],
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
+            // Workload policy updates recheck and close Sandbox-bound TCP streams.
+            updater
+                .handle(Box::new(&mut std::iter::once(XdsUpdate::Update(
+                    XdsResource {
+                        name: "deny".into(),
+                        resource: TrafficPolicy {
+                            egress: Some(traffic_policy::RuleSet {
+                                rules: vec![traffic_policy::Rule {
+                                    action: traffic_policy::Action::Deny.into(),
+                                    r#match: Some(traffic_policy::Match::default()),
+                                }],
+                            }),
+                            ..Default::default()
+                        },
+                    },
+                ))))
+                .unwrap();
+            fixture.bind_policies(&["deny"]);
+            fixture.state.read().unwrap().policies.send();
             assert_eq!(client.read(&mut received).await.unwrap(), 0);
             assert_eq!(server.read(&mut received).await.unwrap(), 0);
             forwarding.await.unwrap();

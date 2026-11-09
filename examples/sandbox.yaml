@@ -29,10 +29,6 @@ workloads:
 sandboxes:
 - uid: workload:local
   workloadUid: cluster1//v1/Pod/default/local
-  trafficPolicy:
-    egress:
-      rules:
-      - action: Allow
 
 # Map keys are xDS resource names; Workload references determine evaluation order.
 policies:

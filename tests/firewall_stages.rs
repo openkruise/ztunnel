@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Real packet checks for the Sandbox gate and ordered Workload stage.
+//! Real packet checks for Workload traffic policies.
 //! Run as root on Linux; each test owns and removes its network namespaces.
 
 #![cfg(target_os = "linux")]
@@ -157,7 +157,7 @@ fn policy(ingress: bool, action: Option<proto::Action>) -> TrafficPolicy {
 #[test_case::test_case("nftables")]
 #[tokio::test]
 #[ignore = "requires root, iproute2, iptables, nftables, python3 and ping"]
-async fn sandbox_allow_requires_workload_allow(kind: &str) {
+async fn workload_policy_controls_traffic(kind: &str) {
     assert_eq!(
         unsafe { libc::geteuid() },
         0,
@@ -182,19 +182,13 @@ async fn sandbox_allow_requires_workload_allow(kind: &str) {
         let allow = policy(ingress, Some(proto::Action::Allow));
         let deny = policy(ingress, Some(proto::Action::Deny));
         let empty = policy(ingress, None);
-        for (case, inline, system, allowed) in [
-            ("both allow", Some(&allow), Some(&allow), true),
-            ("inline allow/system deny", Some(&allow), Some(&deny), false),
-            ("inline deny/system allow", Some(&deny), Some(&allow), false),
-            ("empty inline direction", Some(&empty), Some(&allow), false),
-            ("missing referenced body", Some(&allow), None, false),
-            ("ordinary workload allow", None, Some(&allow), true),
-            ("ordinary workload deny", None, Some(&deny), false),
+        for (case, system, allowed) in [
+            ("workload allow", Some(&allow), true),
+            ("workload deny", Some(&deny), false),
+            ("empty direction", Some(&empty), false),
+            ("missing referenced body", None, false),
         ] {
-            let mut rules = firewall_rulesets(std::iter::once(("system", system)));
-            rules.inline_rules = inline
-                .map(|policy| firewall_rulesets(std::iter::once(("inline", Some(policy)))).rules)
-                .unwrap_or_default();
+            let rules = firewall_rulesets(std::iter::once(("system", system)));
             backend.apply(&rules).await.unwrap();
             backend.apply(&rules).await.unwrap(); // Reconciliation must remain idempotent.
             network.assert_traffic(allowed, &format!("{kind} ingress={ingress} {case}"));

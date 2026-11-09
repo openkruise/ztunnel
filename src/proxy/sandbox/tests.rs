@@ -324,7 +324,6 @@ async fn sandbox_unavailable_uses_workload_policies_while_prepare_still_waits() 
         .insert(crate::sandbox::discovery::Sandbox {
             uid: "sandbox-a".into(),
             workload_uid: Some(other.uid),
-            traffic_policy: None,
         });
     assert!(matches!(
         pi.sandbox_for_connection(),
@@ -348,7 +347,6 @@ async fn sandbox_rpc_and_outbound_share_per_pod_registration_and_drain() {
             state.sandboxes.insert(crate::sandbox::discovery::Sandbox {
                 uid: "sandbox-b".into(),
                 workload_uid: Some(other.uid.clone()),
-                traffic_policy: None,
             });
         }
         let directories = tempfile::tempdir().unwrap();
@@ -448,7 +446,6 @@ async fn failed_prepare_does_not_register_and_allows_corrected_id() {
             .insert(crate::sandbox::discovery::Sandbox {
                 uid: "wrong-workload".into(),
                 workload_uid: Some("other-workload".into()),
-                traffic_policy: None,
             });
         let directory = tempfile::tempdir().unwrap();
         let pi = inputs(

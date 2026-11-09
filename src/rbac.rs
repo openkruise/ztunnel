@@ -388,7 +388,6 @@ pub fn firewall_rulesets<'a>(
         rules,
         // Per-direction defaults are explicit rules; this flag is the legacy
         // Workload policy's bidirectional default.
-        inline_rules: Vec::new(),
         policy_attached: false,
     }
 }

@@ -524,27 +524,12 @@ impl DemandProxyState {
             .workloads
             .find_uid(&ctx.workload.uid)
             .ok_or_else(|| denied(&ctx.workload.uid))?;
-        let sandbox = match &ctx.sandbox {
-            Some(selected) => state
+        if let Some(selected) = &ctx.sandbox {
+            state
                 .sandboxes
                 .get_for_workload(&selected.uid, &workload.uid)
-                .map_err(|_| denied(&selected.uid))?,
-            // Outbound selection belongs to the per-Pod proxy. A demand for a
-            // pending Prepare must not implicitly enroll existing connections.
-            None if ctx.conn.direction == rbac::Direction::Outbound => None,
-            None => state
-                .sandboxes
-                .get_by_workload(&workload.uid)
-                .first()
-                .cloned(),
-        };
-        if let Some(inline) = sandbox
-            .as_ref()
-            .and_then(|sandbox| sandbox.traffic_policy.as_ref())
-        {
-            rbac::assert_policies(std::iter::once(("inline", Some(inline))), &ctx.conn)?;
+                .map_err(|_| denied(&selected.uid))?;
         }
-        // An inline ALLOW passes only the Sandbox stage; Workload policies still apply.
         rbac::assert_policies(workload.traffic_policies(&state.policies), &ctx.conn)
     }
 

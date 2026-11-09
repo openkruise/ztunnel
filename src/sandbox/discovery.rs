@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::rbac::TrafficPolicy;
 use crate::strng::Strng;
 use crate::xds::XdsResource;
 use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
@@ -41,7 +40,6 @@ pub(crate) fn validate_id(id: &str) -> anyhow::Result<()> {
 pub struct Sandbox {
     pub uid: Strng,
     pub workload_uid: Option<Strng>,
-    pub traffic_policy: Option<TrafficPolicy>,
 }
 
 impl TryFrom<XdsSandbox> for Sandbox {
@@ -54,10 +52,6 @@ impl TryFrom<XdsSandbox> for Sandbox {
         let sandbox = Self {
             uid: resource.uid.into(),
             workload_uid,
-            traffic_policy: resource
-                .traffic_policy
-                .map(TrafficPolicy::try_from)
-                .transpose()?,
         };
         sandbox.validate()?;
         Ok(sandbox)
@@ -71,9 +65,6 @@ impl Sandbox {
             self.workload_uid.as_ref().is_none_or(|uid| !uid.is_empty()),
             "empty attester workload UID"
         );
-        if let Some(policy) = &self.traffic_policy {
-            policy.validate()?;
-        }
         Ok(())
     }
 }
@@ -122,9 +113,9 @@ impl SandboxStore {
         let previous = self.resources.insert(sandbox.uid.clone(), sandbox.clone());
         let previous_workload = previous.as_ref().and_then(|s| s.workload_uid.as_deref());
         let workload = sandbox.workload_uid.as_deref();
-        let policy_changed = previous.as_ref().is_none_or(|old| {
-            old.workload_uid != sandbox.workload_uid || old.traffic_policy != sandbox.traffic_policy
-        });
+        let binding_changed = previous
+            .as_ref()
+            .is_none_or(|old| old.workload_uid != sandbox.workload_uid);
         // Keep the selection order stable when only the resource contents change.
         if previous_workload != workload {
             if let Some(uid) = previous_workload {
@@ -137,7 +128,7 @@ impl SandboxStore {
                     .push(sandbox.uid.clone());
             }
         }
-        policy_changed
+        binding_changed
     }
 
     pub fn remove(&mut self, name: &Strng) -> bool {
