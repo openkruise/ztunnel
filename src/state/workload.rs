@@ -21,8 +21,8 @@ use crate::baggage::Baggage;
 use crate::extensions::extensions::{EgressPolicies, EgressPolicyError, WorkloadExtension};
 use crate::state::WorkloadInfo;
 use crate::strng::Strng;
+use crate::xds::agentio::extensions::WorkloadMetadata;
 use crate::xds::istio::workload::{Port, PortList};
-use crate::xds::kruise::networking::extensions::v1::WorkloadMetadata;
 use crate::{strng, xds};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -503,16 +503,14 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                     .as_ref()
                     .ok_or_else(|| WorkloadError::PolicyReference("missing config".into()))?;
                 if traffic_policy_refs.is_some()
-                    || config.type_url
-                        != "type.googleapis.com/kruise.networking.extensions.v1.PolicyReference"
+                    || config.type_url != "type.googleapis.com/agentio.extensions.PolicyReference"
                 {
                     return Err(WorkloadError::PolicyReference(
                         "duplicate reference extension or invalid config type".into(),
                     ));
                 }
-                let refs = xds::kruise::networking::extensions::v1::PolicyReference::decode(
-                    config.value.as_slice(),
-                )?;
+                let refs =
+                    xds::agentio::extensions::PolicyReference::decode(config.value.as_slice())?;
                 if refs.type_url != xds::TRAFFIC_POLICY_TYPE {
                     return Err(WorkloadError::PolicyReference(format!(
                         "unsupported policy type: {}",
@@ -1001,13 +999,13 @@ mod tests {
     use crate::config::ConfigSource;
     use crate::state::{DemandProxyState, ProxyState, UpstreamDestination};
     use crate::test_helpers::helpers::initialize_telemetry;
+    use crate::xds::agentio::extensions as ext_proto;
     use crate::xds::istio::workload::PortList as XdsPortList;
     use crate::xds::istio::workload::Service as XdsService;
     use crate::xds::istio::workload::WorkloadStatus as XdsStatus;
     use crate::xds::istio::workload::WorkloadStatus;
     use crate::xds::istio::workload::load_balancing::HealthPolicy;
     use crate::xds::istio::workload::{LoadBalancing, Port as XdsPort};
-    use crate::xds::kruise::networking::extensions::v1 as ext_proto;
     use crate::xds::{LocalClient, ProxyStateUpdateMutator};
     use crate::{cert_fetcher, test_helpers};
     use bytes::Bytes;
@@ -1032,8 +1030,7 @@ mod tests {
         let reference = |names: Vec<&str>| xds::istio::workload::Extension {
             name: "traffic-policy-reference".into(),
             config: Some(Any {
-                type_url: "type.googleapis.com/kruise.networking.extensions.v1.PolicyReference"
-                    .into(),
+                type_url: "type.googleapis.com/agentio.extensions.PolicyReference".into(),
                 value: ext_proto::PolicyReference {
                     type_url: xds::TRAFFIC_POLICY_TYPE.to_string(),
                     resources: names
@@ -1083,9 +1080,7 @@ mod tests {
             extensions: vec![xds::istio::workload::Extension {
                 name: "sni-traffic-policy".into(),
                 config: Some(Any {
-                    type_url:
-                        "type.googleapis.com/kruise.networking.extensions.v1.SniTrafficPolicy"
-                            .into(),
+                    type_url: "type.googleapis.com/agentio.extensions.SniTrafficPolicy".into(),
                     // SNI policies belong to the gateway; ztunnel must not decode them.
                     value: vec![0xff],
                 }),
@@ -1108,8 +1103,7 @@ mod tests {
             extensions: vec![xds::istio::workload::Extension {
                 name: "egress-policies".into(),
                 config: Some(Any {
-                    type_url: "type.googleapis.com/kruise.networking.extensions.v1.EgressPolicies"
-                        .into(),
+                    type_url: "type.googleapis.com/agentio.extensions.EgressPolicies".into(),
                     value: policies.encode_to_vec(),
                 }),
             }],

@@ -902,9 +902,7 @@ async fn workload_references_recheck_tcp_and_firewall() {
     let mut notifications = f.state.read().unwrap().policies.subscribe();
     let names = ["trafficPolicies/allow", "trafficPolicies/deny"];
     let publish = |refs: &[&str]| {
-        use crate::xds::kruise::networking::extensions::v1::{
-            PolicyReference, PolicyResourceReference,
-        };
+        use crate::xds::agentio::extensions::{PolicyReference, PolicyResourceReference};
         use prost::Message;
         let reference = PolicyReference {
             type_url: TRAFFIC_POLICY_TYPE.to_string(),
@@ -926,9 +924,7 @@ async fn workload_references_recheck_tcp_and_firewall() {
                 extensions: vec![crate::xds::istio::workload::Extension {
                     name: "traffic-policy-reference".into(),
                     config: Some(prost_types::Any {
-                        type_url:
-                            "type.googleapis.com/kruise.networking.extensions.v1.PolicyReference"
-                                .into(),
+                        type_url: "type.googleapis.com/agentio.extensions.PolicyReference".into(),
                         value: reference.encode_to_vec(),
                     }),
                 }],

@@ -28,18 +28,6 @@ pub mod service {
     }
 }
 
-#[allow(warnings)]
-#[warn(clippy::derive_partial_eq_without_eq)]
-pub mod kruise {
-    pub mod networking {
-        pub mod extensions {
-            pub mod v1 {
-                tonic::include_proto!("kruise.networking.extensions.v1");
-            }
-        }
-    }
-}
-
 pub mod istio {
     pub mod workload {
         tonic::include_proto!("istio.workload");
@@ -50,6 +38,11 @@ pub mod istio {
 }
 
 pub mod agentio {
+    #[allow(warnings)]
+    #[warn(clippy::derive_partial_eq_without_eq)]
+    pub mod extensions {
+        tonic::include_proto!("agentio.extensions");
+    }
     pub mod sandbox {
         tonic::include_proto!("agentio.sandbox");
     }

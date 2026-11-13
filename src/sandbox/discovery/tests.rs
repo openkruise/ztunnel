@@ -83,7 +83,7 @@ fn resource(id: &str, workload_uid: &str) -> XdsResource<XdsSandbox> {
 }
 
 #[test_case::test_case("type.googleapis.com/unknown.Policy"; "unknown")]
-#[test_case::test_case("type.googleapis.com/kruise.networking.extensions.v1.SniTrafficPolicy"; "sni_policy")]
+#[test_case::test_case("type.googleapis.com/agentio.extensions.SniTrafficPolicy"; "sni_policy")]
 fn unknown_extension_allows_sandbox_update(type_url: &str) {
     let mut store = SandboxStore::default();
     store.update(resource("sandbox", "original")).unwrap();
