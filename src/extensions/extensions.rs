@@ -15,20 +15,17 @@
 use crate::state::workload::GatewayAddress;
 use crate::state::workload::{NamespacedHostname, gatewayaddress};
 use crate::strng::Strng;
+use crate::xds::agentio::extensions as proto;
+use crate::xds::agentio::extensions::{EgressPolicies as ProtoEgressPolicies, WorkloadMetadata};
 use crate::xds::istio::workload::Extension as XdsWorkloadExtension;
-use crate::xds::kruise::networking::extensions::v1 as proto;
-use crate::xds::kruise::networking::extensions::v1::{
-    EgressPolicies as ProtoEgressPolicies, WorkloadMetadata,
-};
 use ipnet::IpNet;
 use prost::Message;
 use std::collections::HashSet;
 use tracing::debug;
 
-const WORKLOAD_METADATA_TYPE_URL: &str =
-    "type.googleapis.com/kruise.networking.extensions.v1.WorkloadMetadata";
+const WORKLOAD_METADATA_TYPE_URL: &str = "type.googleapis.com/agentio.extensions.WorkloadMetadata";
 const DEFAULT_EGRESS_POLICIES_TYPE_URL: &str =
-    "type.googleapis.com/kruise.networking.extensions.v1.EgressPolicies";
+    "type.googleapis.com/agentio.extensions.EgressPolicies";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum EgressPolicyAction {
@@ -281,13 +278,13 @@ fn parse_gateway_address(svc: &str, port: u32) -> Result<GatewayAddress, EgressP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::xds::kruise::networking::extensions::v1 as ext_proto;
+    use crate::xds::agentio::extensions as ext_proto;
     use prost_types::Any;
     use std::collections::HashMap;
 
     #[test]
     fn extension_type_urls_match_control_plane_proto_package() {
-        const PREFIX: &str = "type.googleapis.com/kruise.networking.extensions.v1.";
+        const PREFIX: &str = "type.googleapis.com/agentio.extensions.";
 
         assert_eq!(
             WORKLOAD_METADATA_TYPE_URL,
