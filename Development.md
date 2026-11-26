@@ -53,6 +53,69 @@ PROXY_WORKLOAD_INFO=default/local/default \
 cargo run --features testing
 ```
 
+### Local gateway mode
+
+`DISCOVERY_MODE=local` starts a single-workload proxy from environment variables.
+It does not open an xDS connection. Intercepted TCP connections are sent to the
+configured egress gateway over mTLS HBONE, retaining their original destination.
+The gateway applies policy.
+
+```shell
+DISCOVERY_MODE=local \
+WORKLOAD_ID=vm-123 \
+WORKLOAD_IDENTITY=spiffe://agentio.local/ns/vm/sa/tunnel \
+INSTANCE_IP=10.0.0.10 \
+SANDBOX_ID=sandbox-123 \
+EGRESS_GATEWAY_ADDRESS=egress.example.com:15008 \
+EGRESS_GATEWAY_IDENTITY=spiffe://agentio.local/ns/gateway/sa/porter \
+CA_ADDRESS=https://agentiod.example.com:15012 \
+CA_ROOT_CA=/etc/agentio/root-cert.pem \
+AUTH_TOKEN=/run/agentio/bootstrap.token \
+./ztunnel
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `WORKLOAD_ID` | Required stable identifier of the local workload. |
+| `WORKLOAD_IDENTITY` | Required SPIFFE identity for the workload certificate. |
+| `INSTANCE_IP` | Workload IP; defaults to `127.0.0.1`. |
+| `SANDBOX_ID` | Optional Sandbox UID bound to this workload and included in HBONE requests. |
+| `EGRESS_GATEWAY_ADDRESS` | Required IP or DNS hostname with a nonzero port; IPv6 uses `[address]:port`. |
+| `EGRESS_GATEWAY_IDENTITY` | Required SPIFFE identity expected in the gateway certificate. |
+| `CA_ADDRESS` | Required certificate service endpoint. |
+| `CA_ROOT_CA`, `AUTH_TOKEN`, `SECRET_TTL` | Existing CA trust, bootstrap credential and requested certificate lifetime settings. |
+
+Identities use the existing `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>`
+format. These names do not require Kubernetes objects. The CA must authenticate
+the bootstrap credential and authorize the requested identity. Non-Kubernetes
+credentials require the corresponding CA authentication and authorization
+adapter; selecting local mode does not add that adapter to agentiod.
+The gateway must already be able to resolve and validate the Sandbox's binding
+to the authenticated workload; setting `SANDBOX_ID` does not register it.
+
+Local mode defaults to `PROXY_MODE=dedicated` and binds listeners in the process's
+current network namespace. The external runtime owns network setup and transparent
+traffic redirection. Its rules must exempt ztunnel's own traffic, including CA and
+gateway connections, for example by process UID. Merely starting the listener does
+not capture application traffic.
+
+Startup obtains the first workload certificate before starting the proxy.
+Certificate renewal uses the existing secret manager. Gateway connection or
+identity verification failures close the proxied connection without direct
+fallback. Only the workload's own certificate is requested.
+
+DNS capture defaults off in this mode; resolving a DNS-named gateway still uses
+the process's resolver. No local TrafficPolicy is installed. Local mode uses a
+fixed Sandbox binding rather than the xDS-dependent Sandbox manager, and rejects
+`ENABLE_SANDBOX_MANAGER`, `XDS_ON_DEMAND`, `LOCAL_XDS` and `LOCAL_XDS_PATH`.
+Other than certificate renewal and gateway DNS resolution, bootstrap configuration
+is fixed until restart.
+
+`DISCOVERY_MODE=xds` is the default and preserves the existing discovery behavior,
+including the development overrides above. In local mode `XDS_ADDRESS` and the
+mesh discovery address do not create a discovery connection; configure
+`CA_ADDRESS` explicitly.
+
 ### In-pod mode setup
 
 Create a netns for your "pod" (in this case, just a network namespace):

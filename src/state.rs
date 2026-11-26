@@ -50,6 +50,7 @@ use tracing::{debug, trace, warn};
 
 use self::workload::ApplicationTunnel;
 
+mod local;
 pub mod service;
 pub mod workload;
 
@@ -805,10 +806,17 @@ impl ProxyStateManager {
         cert_manager: Arc<SecretManager>,
     ) -> anyhow::Result<ProxyStateManager> {
         let cert_fetcher = cert_fetcher::new(&config, cert_manager);
-        let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(
-            config.local_node.as_ref().map(strng::new),
-        )));
-        let xds_client = if config.xds_address.is_some() {
+        let initial_state = match &config.discovery {
+            config::DiscoveryConfig::Xds => {
+                ProxyState::new(config.local_node.as_ref().map(strng::new))
+            }
+            config::DiscoveryConfig::Local(local) => local::build(&config, local),
+        };
+        let state = Arc::new(RwLock::new(initial_state));
+        let xds_client = if matches!(config.discovery, config::DiscoveryConfig::Local(_)) {
+            awaiting_ready.send_replace(());
+            None
+        } else if config.xds_address.is_some() {
             let updater = ProxyStateUpdater::new(state.clone(), cert_fetcher.clone());
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),

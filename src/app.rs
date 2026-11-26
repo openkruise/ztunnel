@@ -37,6 +37,12 @@ pub async fn build_with_cert(
     config: Arc<config::Config>,
     cert_manager: Arc<SecretManager>,
 ) -> anyhow::Result<Bound> {
+    if let config::DiscoveryConfig::Local(local) = &config.discovery {
+        cert_manager
+            .fetch_certificate(&local.identity)
+            .await
+            .context("fetch local workload certificate")?;
+    }
     // Start the data plane worker pool.
     let data_plane_pool = new_data_plane_pool(config.num_worker_threads);
 
