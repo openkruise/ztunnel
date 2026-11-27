@@ -37,6 +37,14 @@ pub async fn build_with_cert(
     config: Arc<config::Config>,
     cert_manager: Arc<SecretManager>,
 ) -> anyhow::Result<Bound> {
+    if let crate::identity::CertificateIdentity::Workload { identity, .. } =
+        config.certificate_identity()
+    {
+        cert_manager
+            .fetch_certificate(&identity)
+            .await
+            .context("fetch local workload certificate")?;
+    }
     // Start the data plane worker pool.
     let data_plane_pool = new_data_plane_pool(config.num_worker_threads);
 
@@ -187,11 +195,17 @@ pub async fn build_with_cert(
         })?;
     } else {
         tracing::info!("proxy mode enabled");
-        let wli = config
-            .proxy_workload_information
-            .clone()
-            .expect("proxy_workload_information is required for dedicated mode");
-        let proxies = proxy_gen.new_proxies_for_dedicated(wli).await?;
+        let workload = match &config.discovery {
+            crate::config::DiscoveryConfig::Local(local) => {
+                crate::state::WorkloadReference::Uid(local.workload_id.clone())
+            }
+            crate::config::DiscoveryConfig::Xds => config
+                .proxy_workload_information
+                .clone()
+                .expect("proxy_workload_information is required for dedicated mode")
+                .into(),
+        };
+        let proxies = proxy_gen.new_proxies_for_dedicated(workload).await?;
         match proxies.proxy {
             Some(proxy) => {
                 proxy_addresses = Some(proxy.addresses());

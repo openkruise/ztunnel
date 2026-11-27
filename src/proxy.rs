@@ -51,7 +51,7 @@ use crate::proxy::socks5::Socks5;
 use crate::rbac::Connection;
 use crate::state::service::{Service, ServiceDescription};
 use crate::state::workload::Workload;
-use crate::state::{DemandProxyState, WorkloadInfo};
+use crate::state::{DemandProxyState, WorkloadReference};
 use crate::{config, identity, socket, tls};
 
 pub mod connection_manager;
@@ -226,7 +226,7 @@ pub struct Proxy {
 }
 
 pub struct LocalWorkloadInformation {
-    wi: Arc<WorkloadInfo>,
+    workload: WorkloadReference,
     state: DemandProxyState,
     // full_cert_manager gives access to the full SecretManager. This MUST only be given restricted
     // access to the appropriate certificates
@@ -235,43 +235,40 @@ pub struct LocalWorkloadInformation {
 
 impl LocalWorkloadInformation {
     pub fn new(
-        wi: Arc<WorkloadInfo>,
+        workload: impl Into<WorkloadReference>,
         state: DemandProxyState,
         cert_manager: Arc<SecretManager>,
     ) -> LocalWorkloadInformation {
         LocalWorkloadInformation {
-            wi,
+            workload: workload.into(),
             state,
             full_cert_manager: cert_manager,
         }
     }
 
     pub async fn get_workload(&self) -> Result<Arc<Workload>, Error> {
-        get_workload(&self.state, self.wi.clone()).await
+        get_workload(&self.state, &self.workload).await
     }
 
     pub async fn fetch_certificate(
         &self,
     ) -> Result<Arc<tls::WorkloadCertificate>, identity::Error> {
-        // We don't know the trust domain until we get the workload from XDS, so fetch that
+        // Discovery or local bootstrap supplies the full identity of this workload.
         let wl = self
             .get_workload()
             .await
-            .map_err(|_| identity::Error::UnknownWorkload(self.workload_info()))?;
-        let id = &Identity::Spiffe {
-            trust_domain: wl.trust_domain.clone(),
-            namespace: (&self.wi.namespace).into(),
-            service_account: (&self.wi.service_account).into(),
-        };
-        self.full_cert_manager.fetch_certificate(id).await
+            .map_err(|_| identity::Error::UnknownWorkload(self.workload.clone()))?;
+        self.full_cert_manager
+            .fetch_certificate(&wl.identity())
+            .await
     }
 
-    pub fn workload_info(&self) -> Arc<WorkloadInfo> {
-        self.wi.clone()
+    pub fn workload_reference(&self) -> WorkloadReference {
+        self.workload.clone()
     }
 
     pub fn as_fetcher(&self) -> Arc<LocalWorkloadFetcher> {
-        LocalWorkloadFetcher::new(self.wi.clone(), self.state.clone())
+        LocalWorkloadFetcher::new(self.workload.clone(), self.state.clone())
     }
 }
 
@@ -279,27 +276,30 @@ impl LocalWorkloadInformation {
 /// This is used to down-scope the LocalWorkloadInformation for components who should not have access
 /// to certificates.
 pub struct LocalWorkloadFetcher {
-    wi: Arc<WorkloadInfo>,
+    workload: WorkloadReference,
     state: DemandProxyState,
 }
 
 impl LocalWorkloadFetcher {
-    pub fn new(wi: Arc<WorkloadInfo>, state: DemandProxyState) -> Arc<Self> {
-        Arc::new(LocalWorkloadFetcher { wi, state })
+    pub fn new(workload: impl Into<WorkloadReference>, state: DemandProxyState) -> Arc<Self> {
+        Arc::new(LocalWorkloadFetcher {
+            workload: workload.into(),
+            state,
+        })
     }
     pub async fn get_workload(&self) -> Result<Arc<Workload>, Error> {
-        get_workload(&self.state, self.wi.clone()).await
+        get_workload(&self.state, &self.workload).await
     }
 }
 
 async fn get_workload(
     state: &DemandProxyState,
-    wi: Arc<WorkloadInfo>,
+    workload: &WorkloadReference,
 ) -> Result<Arc<Workload>, Error> {
     state
-        .wait_for_workload(&wi, Duration::from_secs(5))
+        .wait_for_workload(workload, Duration::from_secs(5))
         .await
-        .ok_or_else(|| Error::UnknownSourceWorkload(wi.clone()))
+        .ok_or_else(|| Error::UnknownSourceWorkload(workload.clone()))
 }
 
 #[derive(Clone)]
@@ -365,7 +365,7 @@ impl ProxyInputs {
                 let state = self.state.read();
                 Ok(state
                     .workloads
-                    .find_by_info(&self.local_workload_information.workload_info())
+                    .find_by_reference(&self.local_workload_information.workload_reference())
                     .and_then(|workload| {
                         state
                             .sandboxes
@@ -441,7 +441,7 @@ impl Proxy {
                 pi.state.clone(),
                 drain,
                 detected,
-                pi.local_workload_information.workload_info(),
+                pi.local_workload_information.workload_reference(),
                 pi.cfg.firewall_debounce_interval,
                 pi.cfg.firewall_max_debounce_time,
                 fw_metrics,
@@ -597,7 +597,7 @@ pub enum Error {
     Identity(#[from] identity::Error),
 
     #[error("failed to fetch information about local workload: {0}")]
-    UnknownSourceWorkload(Arc<WorkloadInfo>),
+    UnknownSourceWorkload(WorkloadReference),
 
     #[error("unknown waypoint: {0}")]
     UnknownWaypoint(String),

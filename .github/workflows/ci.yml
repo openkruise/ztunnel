@@ -64,7 +64,7 @@ jobs:
 
       - name: Run unprivileged tests
         run: |
-          env -u RUST_LOG cargo test --locked --lib --test direct --bins -- \
+          env -u RUST_LOG cargo test --locked --lib --test direct --test local --bins -- \
             --test-threads=1 \
             --skip inpod:: \
             --skip proxy::sandbox::tests::sandbox_rpc_binds_same_address_in_distinct_pod_netns \

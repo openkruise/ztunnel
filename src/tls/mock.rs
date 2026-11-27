@@ -184,21 +184,43 @@ pub fn generate_test_certs(
 }
 
 #[derive(Debug, Clone)]
-pub struct MockServerCertProvider(Arc<WorkloadCertificate>);
+pub struct MockServerCertProvider(Arc<WorkloadCertificate>, bool);
 
 impl MockServerCertProvider {
     pub fn new(w: WorkloadCertificate) -> Self {
-        MockServerCertProvider(Arc::new(w))
+        MockServerCertProvider(Arc::new(w), false)
+    }
+
+    pub fn with_optional_client_auth(mut self) -> Self {
+        self.1 = true;
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl ServerCertProvider for MockServerCertProvider {
     async fn fetch_cert(&mut self) -> Result<Arc<ServerConfig>, TlsError> {
-        let mut sc = ServerConfig::builder_with_provider(crate::tls::lib::provider())
+        let builder = ServerConfig::builder_with_provider(crate::tls::lib::provider())
             .with_protocol_versions(tls_versions())
-            .expect("server config must be valid")
-            .with_no_client_auth()
+            .expect("server config must be valid");
+        let builder = if self.1 {
+            let mut roots = rustls::RootCertStore::empty();
+            for root in &self.0.roots {
+                roots.add(root.der.clone()).unwrap();
+            }
+            builder.with_client_cert_verifier(
+                rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    crate::tls::lib::provider(),
+                )
+                .allow_unauthenticated()
+                .build()
+                .unwrap(),
+            )
+        } else {
+            builder.with_no_client_auth()
+        };
+        let mut sc = builder
             .with_single_cert(
                 self.0.cert_and_intermediates_der(),
                 self.0.private_key.clone_key(),

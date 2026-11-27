@@ -20,6 +20,11 @@ use std::sync::Arc;
 mod workload_identity;
 pub use workload_identity::*;
 
+mod spiffe;
+pub use spiffe::Identity;
+
+mod credentials;
+
 mod caclient;
 pub use caclient::*;
 
@@ -27,7 +32,7 @@ pub mod manager;
 pub use manager::*;
 
 mod auth;
-use crate::state::WorkloadInfo;
+use crate::state::WorkloadReference;
 pub use auth::*;
 
 #[cfg(any(test, feature = "testing"))]
@@ -40,6 +45,10 @@ pub mod mock {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {
+    #[error("local identity I/O error: {0}")]
+    Io(#[from] Arc<std::io::Error>),
+    #[error("invalid local identity file: {0}")]
+    Json(#[from] Arc<serde_json::Error>),
     #[error("workload identity: {0}")]
     WorkloadIdentity(String),
     #[error("failed to create CSR: {0}")]
@@ -55,11 +64,11 @@ pub enum Error {
     #[error("invalid spiffe identity: {0}")]
     Spiffe(String),
     #[error("workload is unknown: {0}")]
-    UnknownWorkload(Arc<WorkloadInfo>),
+    UnknownWorkload(WorkloadReference),
     #[error("the identity is no longer needed")]
     Forgotten,
     #[error("BUG: identity requested {0}, but only allowed {1:?}")]
-    BugInvalidIdentityRequest(Identity, Arc<WorkloadInfo>),
+    BugInvalidIdentityRequest(Identity, WorkloadReference),
 }
 
 impl From<tls::Error> for Error {

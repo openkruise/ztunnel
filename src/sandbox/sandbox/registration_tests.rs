@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::sandbox::discovery::tests::Fixture;
+use crate::state::WorkloadInfo;
 use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
 use crate::{proxy, test_helpers, tls, xds};
 use futures_util::FutureExt;

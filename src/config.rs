@@ -33,8 +33,13 @@ use hyper::http::uri::InvalidUri;
 use crate::probe;
 use crate::strng::Strng;
 use crate::{identity, state};
+mod local;
+pub use local::{DiscoveryConfig, GatewayEndpoint, LocalConfig, LocalGateway};
 #[cfg(any(test, feature = "testing"))]
-use {crate::test_helpers::MpscAckReceiver, crate::xds::LocalConfig, tokio::sync::Mutex};
+use {
+    crate::test_helpers::MpscAckReceiver, crate::xds::LocalConfig as LocalXdsConfig,
+    tokio::sync::Mutex,
+};
 
 const ENABLE_ADMIN_UNIX_SOCKET: &str = "ENABLE_ADMIN_UNIX_SOCKET";
 const ADMIN_UNIX_SOCKET_PATH: &str = "ADMIN_UNIX_SOCKET_PATH";
@@ -175,7 +180,7 @@ pub enum ConfigSource {
     File(PathBuf),
     Static(Bytes),
     #[cfg(any(test, feature = "testing"))]
-    Dynamic(Arc<Mutex<MpscAckReceiver<LocalConfig>>>),
+    Dynamic(Arc<Mutex<MpscAckReceiver<LocalXdsConfig>>>),
 }
 
 impl ConfigSource {
@@ -254,6 +259,7 @@ impl serde::Serialize for MetadataVector {
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    pub discovery: DiscoveryConfig,
     /// If true, the HBONE proxy will be used.
     pub proxy: bool,
     /// If true, a DNS proxy will be used.
@@ -332,6 +338,8 @@ pub struct Config {
     /// and the gRPC channel is rebuilt automatically on cert rotation.
     /// Only effective when ca_root_cert is a file path.
     pub ca_cert_watcher: bool,
+    /// Directory for persistent workload credentials and certificate-authenticated renewal.
+    pub workload_identity_dir: Option<PathBuf>,
     // Allow custom alternative CA hostname verification
     pub alt_ca_hostname: Option<String>,
     /// XDS address to use. If unset, XDS will not be used.
@@ -624,6 +632,7 @@ fn parse_proxy_config() -> Result<ProxyConfig, Error> {
 }
 
 pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
+    let discovery = local::parse()?;
     let ipv6_enabled = parse::<bool>(IPV6_ENABLED)?.unwrap_or(true);
     let ipv6_localhost_enabled = if ipv6_enabled {
         // IPv6 may be generally enabled, but not on localhost. In that case, we do not want to bind on IPv6.
@@ -644,11 +653,15 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     } else {
         "https://localhost:15012".to_string()
     };
-    let xds_address = validate_uri(empty_to_none(
-        parse(XDS_ADDRESS)?
-            .or(pc.discovery_address)
-            .or_else(|| Some(default_istiod_address.clone())),
-    ))?;
+    let xds_address = if matches!(discovery, DiscoveryConfig::Local(_)) {
+        None
+    } else {
+        validate_uri(empty_to_none(
+            parse(XDS_ADDRESS)?
+                .or(pc.discovery_address)
+                .or_else(|| Some(default_istiod_address.clone())),
+        ))?
+    };
 
     let prefered_service_namespace = match parse::<String>(PREFERED_SERVICE_NAMESPACE) {
         Ok(ns) => ns,
@@ -669,7 +682,14 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     let ca_address = validate_uri(empty_to_none(if fake_ca {
         None
     } else {
-        Some(parse_default(CA_ADDRESS, default_istiod_address)?)
+        Some(match discovery {
+            DiscoveryConfig::Local(_) => parse::<String>(CA_ADDRESS)?
+                .filter(|address| !address.is_empty())
+                .ok_or_else(|| {
+                    Error::InvalidState(format!("{CA_ADDRESS} is required in local mode"))
+                })?,
+            DiscoveryConfig::Xds => parse_default(CA_ADDRESS, default_istiod_address)?,
+        })
     }))?;
 
     let xds_root_cert_provider =
@@ -776,9 +796,12 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
                 ));
             }
         },
+        None if matches!(discovery, DiscoveryConfig::Local(_)) => ProxyMode::Dedicated,
         None => ProxyMode::Shared,
     };
-    let proxy_workload_information = if proxy_mode != ProxyMode::Shared {
+    let proxy_workload_information = if matches!(discovery, DiscoveryConfig::Local(_)) {
+        None
+    } else if proxy_mode != ProxyMode::Shared {
         let info = if let Some(raw) = parse::<String>(PROXY_WORKLOAD_INFO)? {
             let parts: Vec<&str> = raw.split('/').collect();
             match parts.as_slice() {
@@ -865,13 +888,16 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     };
 
     validate_config(Config {
+        discovery: discovery.clone(),
         proxy: parse_default(ENABLE_PROXY, true)?,
-        // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
-        // DNS requests to Ztunnel.
+        // Enable DNS capture by default for discovery mode. Local gateway mode does not
+        // need mesh DNS, but can opt in through the existing DNS_CAPTURE setting.
         dns_proxy: pc
             .proxy_metadata
             .get(DNS_CAPTURE_METADATA)
-            .is_none_or(|value| value.to_lowercase() == "true"),
+            .map_or(matches!(discovery, DiscoveryConfig::Xds), |value| {
+                value.to_lowercase() == "true"
+            }),
 
         pool_max_streams_per_conn: parse_default(
             POOL_MAX_STREAMS_PER_CONNECTION,
@@ -970,6 +996,10 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         ca_address,
         ca_root_cert,
         ca_cert_watcher,
+        workload_identity_dir: match &discovery {
+            DiscoveryConfig::Local(_) => parse("WORKLOAD_IDENTITY_DIR")?,
+            DiscoveryConfig::Xds => None,
+        },
         alt_xds_hostname: parse(ALT_XDS_HOSTNAME)?,
         alt_ca_hostname: parse(ALT_CA_HOSTNAME)?,
 
@@ -1103,11 +1133,33 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         )?,
         kube_app_probes: probers,
         probe_keepalive_connections: parse_default("ENABLE_PROBE_KEEPALIVE_CONNECTIONS", false)?,
-        pod_ip: parse_default("INSTANCE_IP", "127.0.0.1".to_string())?,
+        pod_ip: match &discovery {
+            DiscoveryConfig::Local(local) => local.workload_ip.to_string(),
+            DiscoveryConfig::Xds => parse_default("INSTANCE_IP", "127.0.0.1".to_string())?,
+        },
     })
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
+    if matches!(cfg.discovery, DiscoveryConfig::Local(_)) {
+        if cfg.proxy_mode != ProxyMode::Dedicated || !cfg.proxy {
+            return Err(Error::InvalidState(
+                "local mode requires an enabled proxy and PROXY_MODE=dedicated".into(),
+            ));
+        }
+        if let Some(directory) = &cfg.workload_identity_dir
+            && (directory.as_os_str().is_empty() || !directory.is_absolute() || cfg.fake_ca)
+        {
+            return Err(Error::InvalidState(
+                "WORKLOAD_IDENTITY_DIR requires an absolute path and a real CA".into(),
+            ));
+        }
+        if cfg.local_xds_config.is_some() || cfg.xds_on_demand || cfg.enable_sandbox_manager {
+            return Err(Error::InvalidState(
+                "local mode does not support LOCAL_XDS, LOCAL_XDS_PATH, XDS_ON_DEMAND or ENABLE_SANDBOX_MANAGER".into(),
+            ));
+        }
+    }
     if cfg.sandbox_token_enabled && !cfg.enable_sandbox_manager {
         return Err(Error::InvalidState(format!(
             "{SANDBOX_TOKEN_ENABLED} requires {ENABLE_SANDBOX_MANAGER}"

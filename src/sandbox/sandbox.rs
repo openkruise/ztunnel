@@ -22,7 +22,7 @@ use http::HeaderValue;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::sandbox::discovery::{Sandbox, validate_id};
-use crate::state::{DemandProxyState, WorkloadInfo};
+use crate::state::{DemandProxyState, WorkloadReference};
 use crate::strng::{self, Strng};
 use crate::xds::SANDBOX_TYPE;
 
@@ -86,7 +86,7 @@ pub(crate) struct SandboxContext {
 /// Manages one workload proxy's Sandbox identity, token and policy readiness.
 pub struct SandboxManager {
     state: DemandProxyState,
-    workload: Arc<WorkloadInfo>,
+    workload: WorkloadReference,
     pub(crate) token: Option<FileSandboxToken>,
     // Only identity is persisted. Readiness is checked against the current xDS snapshot.
     directory: Option<PathBuf>,
@@ -96,10 +96,10 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    pub fn new(state: DemandProxyState, workload: Arc<WorkloadInfo>) -> Self {
+    pub fn new(state: DemandProxyState, workload: impl Into<WorkloadReference>) -> Self {
         Self {
             state,
-            workload,
+            workload: workload.into(),
             token: None,
             directory: None,
             id: watch::channel(None).0,
@@ -267,7 +267,7 @@ impl SandboxManager {
         let state = self.state.read();
         let workload = state
             .workloads
-            .find_by_info(&self.workload)
+            .find_by_reference(&self.workload)
             .ok_or(Error::NotReady)?;
         state
             .sandboxes

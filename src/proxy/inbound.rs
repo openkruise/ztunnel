@@ -728,7 +728,7 @@ struct InboundCertProvider {
 impl crate::tls::ServerCertProvider for InboundCertProvider {
     async fn fetch_cert(&mut self) -> Result<Arc<rustls::ServerConfig>, TlsError> {
         debug!(
-            identity=%self.local_workload.workload_info(),
+            identity=%self.local_workload.workload_reference(),
             "fetching cert"
         );
         let cert = self.local_workload.fetch_certificate().await?;

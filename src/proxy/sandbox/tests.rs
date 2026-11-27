@@ -43,7 +43,7 @@ async fn inputs(
         state.clone(),
         crate::identity::mock::new_secret_manager(Duration::from_secs(10)),
     ));
-    let mut manager = SandboxManager::new(state.clone(), local.workload_info())
+    let mut manager = SandboxManager::new(state.clone(), local.workload_reference())
         .with_registration(directory.into())
         .unwrap();
     let tokens = directory.join("tokens");
@@ -487,7 +487,7 @@ async fn failed_prepare_does_not_register_and_allows_corrected_id() {
         );
         let restored = SandboxManager::new(
             fixture.demand.clone(),
-            pi.local_workload_information.workload_info(),
+            pi.local_workload_information.workload_reference(),
         )
         .with_registration(directory.path().into())
         .unwrap();
@@ -572,7 +572,7 @@ async fn concurrent_prepare_commits_only_one_identity() {
     );
     let restored = SandboxManager::new(
         fixture.demand.clone(),
-        pi.local_workload_information.workload_info(),
+        pi.local_workload_information.workload_reference(),
     )
     .with_registration(directory.path().into())
     .unwrap();

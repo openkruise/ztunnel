@@ -19,7 +19,7 @@ use prost::Message;
 
 use crate::baggage::Baggage;
 use crate::extensions::extensions::{EgressPolicies, EgressPolicyError, WorkloadExtension};
-use crate::state::WorkloadInfo;
+use crate::state::{WorkloadInfo, WorkloadReference};
 use crate::strng::Strng;
 use crate::xds::agentio::extensions::WorkloadMetadata;
 use crate::xds::istio::workload::{Port, PortList};
@@ -245,6 +245,10 @@ pub struct Workload {
     pub trust_domain: Strng,
     #[serde(default, skip_serializing_if = "is_default")]
     pub service_account: Strng,
+    /// Explicit identity for local and other non-Kubernetes workloads. Legacy
+    /// discovery resources retain the ServiceAccount identity when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<Identity>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub network: Strng,
 
@@ -333,11 +337,13 @@ impl Workload {
     }
 
     pub fn identity(&self) -> Identity {
-        Identity::Spiffe {
-            trust_domain: self.trust_domain.clone(),
-            namespace: self.namespace.clone(),
-            service_account: self.service_account.clone(),
-        }
+        self.principal.clone().unwrap_or_else(|| {
+            Identity::from_parts(
+                self.trust_domain.clone(),
+                self.namespace.clone(),
+                self.service_account.clone(),
+            )
+        })
     }
 
     pub fn baggage(&self) -> Baggage {
@@ -533,7 +539,7 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
             }
         }
 
-        let wl = Workload {
+        let mut wl = Workload {
             workload_ips: addresses,
             waypoint: wp,
 
@@ -563,6 +569,7 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                     result.into()
                 }
             },
+            principal: None,
             node: resource.node.into(),
             hostname: resource.hostname.into(),
             network: resource.network.into(),
@@ -598,6 +605,9 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
             egress_policies,
             traffic_policy_refs,
         };
+        // Resolve legacy discovery fields once; proxy and certificate lookups
+        // clone the complete identity without allocating a URI per connection.
+        wl.principal = Some(wl.identity());
         wl.validate_policies()?;
         // Return back part we did not use (service) so it can be consumed without cloning
         Ok((wl, resource.services))
@@ -749,24 +759,18 @@ pub fn network_addr(network: Strng, vip: IpAddr) -> NetworkAddress {
     }
 }
 
-/// WorkloadIdentity provides information about a workloads identity. This is used in place of Identity
-/// in places where we do not have the full identity (no trust domain) and know we are working with workloads specifically.
+/// Kubernetes lookup key used before discovery has supplied the full identity.
 #[derive(Debug, Hash, Eq, PartialEq)]
-struct WorkloadIdentity {
+struct KubernetesIdentity {
     namespace: Strng,
     service_account: Strng,
 }
 
-impl From<&Identity> for WorkloadIdentity {
-    fn from(value: &Identity) -> Self {
-        let Identity::Spiffe {
-            namespace,
-            service_account,
-            ..
-        } = value;
-        WorkloadIdentity {
-            namespace: namespace.clone(),
-            service_account: service_account.clone(),
+impl From<&Workload> for KubernetesIdentity {
+    fn from(value: &Workload) -> Self {
+        Self {
+            namespace: value.namespace.clone(),
+            service_account: value.service_account.clone(),
         }
     }
 }
@@ -785,7 +789,8 @@ pub struct WorkloadStore {
     /// by_uid maps workload UIDs to workloads
     pub(super) by_uid: HashMap<Strng, Arc<Workload>>,
     // Identity->Set of UIDs. Only stores local nodes
-    node_local_by_identity: HashMap<WorkloadIdentity, HashSet<Strng>>,
+    node_local_by_identity: HashMap<Identity, HashSet<Strng>>,
+    node_local_by_kubernetes_identity: HashMap<KubernetesIdentity, HashSet<Strng>>,
 }
 
 #[derive(Debug)]
@@ -864,6 +869,7 @@ impl WorkloadStore {
             insert_notifier: Sender::new(()),
             by_addr: Default::default(),
             node_local_by_identity: Default::default(),
+            node_local_by_kubernetes_identity: Default::default(),
             by_uid: Default::default(),
         }
     }
@@ -892,7 +898,11 @@ impl WorkloadStore {
         // Only track local nodes to avoid overhead
         if self.local_node.is_none() || self.local_node.as_ref() == Some(&w.node) {
             self.node_local_by_identity
-                .entry((&w.identity()).into())
+                .entry(w.identity())
+                .or_default()
+                .insert(w.uid.clone());
+            self.node_local_by_kubernetes_identity
+                .entry(w.as_ref().into())
                 .or_default()
                 .insert(w.uid.clone());
         }
@@ -919,11 +929,18 @@ impl WorkloadStore {
                         }
                     }
                 }
-                let id = (&prev.identity()).into();
+                let id = prev.identity();
                 if let Some(set) = self.node_local_by_identity.get_mut(&id) {
                     set.remove(&prev.uid);
                     if set.is_empty() {
                         self.node_local_by_identity.remove(&id);
+                    }
+                }
+                let key = prev.as_ref().into();
+                if let Some(set) = self.node_local_by_kubernetes_identity.get_mut(&key) {
+                    set.remove(&prev.uid);
+                    if set.is_empty() {
+                        self.node_local_by_kubernetes_identity.remove(&key);
                     }
                 }
 
@@ -941,8 +958,8 @@ impl WorkloadStore {
     pub fn find_by_info(&self, wl: &WorkloadInfo) -> Option<Arc<Workload>> {
         // We do not have an index directly on the full workload info, but we can narrow it down
         // to only workloads on the same node with the same identity -- a tiny set to iterate over
-        self.node_local_by_identity
-            .get(&WorkloadIdentity {
+        self.node_local_by_kubernetes_identity
+            .get(&KubernetesIdentity {
                 namespace: strng::new(&wl.namespace),
                 service_account: strng::new(&wl.service_account),
             })?
@@ -955,13 +972,20 @@ impl WorkloadStore {
         self.by_uid.get(uid).cloned()
     }
 
+    pub fn find_by_reference(&self, reference: &WorkloadReference) -> Option<Arc<Workload>> {
+        match reference {
+            WorkloadReference::Uid(uid) => self.find_uid(uid),
+            WorkloadReference::Kubernetes(info) => self.find_by_info(info),
+        }
+    }
+
     // was_last_identity_on_node is a specialized function to help determine if we should clear a certificate.
     // It is called when a workload is removed, with the node and identity of the workload
     pub fn was_last_identity_on_node(&self, node_name: &Strng, identity: &Identity) -> bool {
         if self.local_node.is_none() || self.local_node.as_ref() == Some(node_name) {
             // This was a workload on the node... now check if there are any remaining workloads with
             // this identity on the node.
-            !self.node_local_by_identity.contains_key(&identity.into())
+            !self.node_local_by_identity.contains_key(identity)
         } else {
             false
         }
@@ -1018,6 +1042,69 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::RwLock;
     use xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+
+    #[test]
+    fn explicit_principals_are_independent_of_kubernetes_metadata() {
+        let first: Identity = "spiffe://example.org/workloads/first".parse().unwrap();
+        let second: Identity = "spiffe://example.org/workloads/second".parse().unwrap();
+        let mut store = WorkloadStore::new(Some("local".into()));
+        for (uid, principal, node) in [
+            ("first-1", &first, "local"),
+            ("first-2", &first, "local"),
+            ("second", &second, "local"),
+            ("remote", &first, "remote"),
+        ] {
+            store.insert(Arc::new(Workload {
+                uid: uid.into(),
+                principal: Some(principal.clone()),
+                node: node.into(),
+                namespace: strng::EMPTY,
+                service_account: strng::EMPTY,
+                ..test_helpers::test_default_workload()
+            }));
+        }
+        let selected = store
+            .find_by_reference(&WorkloadReference::Uid("second".into()))
+            .unwrap();
+        assert_eq!(selected.identity(), second);
+        assert!(selected.namespace.is_empty());
+        assert!(selected.service_account.is_empty());
+
+        // Certificates remain cached while another local workload uses the same
+        // full identity; neither an unrelated path nor a remote node retains it.
+        store.remove(&"first-1".into());
+        assert!(!store.was_last_identity_on_node(&"local".into(), &first));
+        store.remove(&"first-2".into());
+        assert!(store.was_last_identity_on_node(&"local".into(), &first));
+        assert!(!store.was_last_identity_on_node(&"local".into(), &second));
+        assert!(!store.was_last_identity_on_node(&"remote".into(), &first));
+
+        // Replacing a workload must also remove its old certificate index entry.
+        store.insert(Arc::new(Workload {
+            principal: Some(first.clone()),
+            ..selected.as_ref().clone()
+        }));
+        assert!(store.was_last_identity_on_node(&"local".into(), &second));
+        assert!(!store.was_last_identity_on_node(&"local".into(), &first));
+    }
+
+    #[test]
+    fn legacy_discovery_resolves_service_account_identity() {
+        for (trust_domain, service_account, expected) in [
+            ("", "", "spiffe://cluster.local/ns/demo/sa/default"),
+            ("example.org", "app", "spiffe://example.org/ns/demo/sa/app"),
+        ] {
+            let workload = Workload::try_from(XdsWorkload {
+                namespace: "demo".into(),
+                trust_domain: trust_domain.into(),
+                service_account: service_account.into(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(workload.identity().to_string(), expected);
+            assert_eq!(workload.principal, Some(expected.parse().unwrap()));
+        }
+    }
 
     #[test]
     fn native_policy_reference_decoding() {
@@ -1239,6 +1326,11 @@ mod tests {
                 workload_ips: vec![nw_addr1.address],
                 name: "some name".into(),
                 traffic_policy_refs: None,
+                principal: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    strng::EMPTY,
+                    "default".into(),
+                )),
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1254,6 +1346,11 @@ mod tests {
                 workload_ips: vec![nw_addr1.address],
                 name: "some name".into(),
                 traffic_policy_refs: None,
+                principal: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    strng::EMPTY,
+                    "default".into(),
+                )),
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1266,6 +1363,11 @@ mod tests {
                 workload_ips: vec![nw_addr1.address],
                 name: "some name".into(),
                 traffic_policy_refs: None,
+                principal: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    strng::EMPTY,
+                    "default".into(),
+                )),
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1619,6 +1721,11 @@ mod tests {
                 workload_ips: vec![nw_addr1.address],
                 name: "some pod".into(),
                 traffic_policy_refs: None,
+                principal: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    strng::EMPTY,
+                    "default".into(),
+                )),
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1634,6 +1741,11 @@ mod tests {
                 workload_ips: vec![nw_addr1.address],
                 name: "some we".into(),
                 traffic_policy_refs: None,
+                principal: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    strng::EMPTY,
+                    "default".into(),
+                )),
                 ..test_helpers::test_default_workload()
             }))
         );

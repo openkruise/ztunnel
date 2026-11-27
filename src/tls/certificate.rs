@@ -279,7 +279,7 @@ impl WorkloadCertificate {
 
     // TODO: can we precompute some or all of this?
 
-    pub(in crate::tls) fn cert_and_intermediates_der(&self) -> Vec<CertificateDer<'static>> {
+    pub(crate) fn cert_and_intermediates_der(&self) -> Vec<CertificateDer<'static>> {
         std::iter::once(self.cert.der.clone())
             .chain(self.chain.iter().map(|x| x.der.clone()))
             .collect()
@@ -299,13 +299,26 @@ impl WorkloadCertificate {
             .collect()
     }
 
+    pub(crate) fn private_key_pem(&self) -> String {
+        der_to_pem(self.private_key.secret_der(), "PRIVATE KEY")
+    }
+
+    pub(crate) fn client_cert_resolver(
+        &self,
+    ) -> Result<Arc<dyn rustls::client::ResolvesClientCert>, Error> {
+        let key = rustls::sign::CertifiedKey::from_der(
+            self.cert_and_intermediates_der(),
+            self.private_key.clone_key(),
+            &crate::tls::lib::provider(),
+        )?;
+        Ok(Arc::new(rustls::sign::SingleCertAndKey::from(key)))
+    }
+
     pub fn server_config(
         &self,
         crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
     ) -> Result<ServerConfig, Error> {
-        let td = self.cert.identity().map(|i| match i {
-            Identity::Spiffe { trust_domain, .. } => trust_domain,
-        });
+        let td = self.cert.identity().map(|i| i.trust_domain());
 
         // build the base client cert verifier with optional CRL support
         let mut builder = WebPkiClientVerifier::builder_with_provider(

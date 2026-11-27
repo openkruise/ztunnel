@@ -53,6 +53,108 @@ PROXY_WORKLOAD_INFO=default/local/default \
 cargo run --features testing
 ```
 
+### Local gateway mode
+
+`DISCOVERY_MODE=local` starts a single-workload proxy from environment variables.
+It does not open an xDS connection. Intercepted TCP connections are sent to the
+configured egress gateway over mTLS HBONE, retaining their original destination.
+The gateway applies policy.
+
+```shell
+DISCOVERY_MODE=local \
+WORKLOAD_ID=instance-123 \
+WORKLOAD_IDENTITY=spiffe://agentio.local/workloads/instance-123 \
+INSTANCE_IP=10.0.0.10 \
+SANDBOX_ID=sandbox-123 \
+EGRESS_GATEWAY_ADDRESS=egress.example.com:15008 \
+EGRESS_GATEWAY_IDENTITY=spiffe://agentio.local/gateways/porter \
+CA_ADDRESS=https://agentiod.example.com:15012 \
+CA_ROOT_CA=/etc/agentio/root-cert.pem \
+AUTH_TOKEN=/run/agentio/bootstrap.token \
+./ztunnel
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `WORKLOAD_ID` | Required stable identifier of the local workload. |
+| `WORKLOAD_IDENTITY` | Required SPIFFE identity for the workload certificate. |
+| `INSTANCE_IP` | Workload IP; defaults to `127.0.0.1`. |
+| `SANDBOX_ID` | Required fixed Sandbox UID included in HBONE requests. Changing it requires restarting ztunnel. |
+| `EGRESS_GATEWAY_ADDRESS` | Required IP or DNS hostname with a nonzero port; IPv6 uses `[address]:port`. |
+| `EGRESS_GATEWAY_IDENTITY` | Required SPIFFE identity expected in the gateway certificate. |
+| `CA_ADDRESS` | Required certificate service endpoint. |
+| `CA_ROOT_CA`, `AUTH_TOKEN`, `SECRET_TTL` | Existing CA trust, bootstrap credential and requested certificate lifetime settings. |
+| `WORKLOAD_IDENTITY_DIR` | Optional absolute directory for the instance certificate and private key; enables certificate authentication for subsequent CA requests. |
+
+Identities are complete SPIFFE URIs; their paths do not require a namespace or
+ServiceAccount. `WORKLOAD_ID` selects the local workload by UID independently of
+its certificate identity. Local mode ignores `PROXY_WORKLOAD_INFO` and does not
+require Pod metadata. The CA must authenticate the bootstrap credential and
+authorize the requested identity. Non-Kubernetes
+credentials require the corresponding CA authentication and authorization
+adapter; selecting local mode does not add that adapter to agentiod.
+The gateway must already be able to resolve and validate the Sandbox's binding
+to the authenticated workload; setting `SANDBOX_ID` does not register it.
+
+The bootstrap adapters meet at the proxy state: local configuration creates a
+workload with its UID and explicit principal, while the xDS adapter translates
+legacy namespace/ServiceAccount fields into a SPIFFE identity. The shared proxy
+looks up its workload through `WorkloadReference` (UID or Kubernetes metadata)
+and obtains certificates using `Workload::identity()`. The identity module treats
+SPIFFE paths as opaque; TLS still checks the trust domain and the expected peer
+identity. Certificate acquisition, renewal, HBONE forwarding and connection
+pools are shared by both modes. Existing xDS wire formats remain compatible.
+
+Discovery is selected at the shared entry point. Configuration resolves the
+certificate identity before constructing the CA client, which consumes
+`CertificateIdentity` independently of the discovery source. Credential storage
+receives only a principal, workload UID and directory. Local bootstrap installs
+the fixed Sandbox binding directly into the shared proxy state.
+
+Local mode defaults to `PROXY_MODE=dedicated` and binds listeners in the process's
+current network namespace. The external runtime owns network setup and transparent
+traffic redirection. Its rules must exempt ztunnel's own traffic, including CA and
+gateway connections, for example by process UID. Merely starting the listener does
+not capture application traffic.
+
+Startup obtains the first workload certificate before starting the proxy.
+Certificate renewal uses the existing secret manager. Every local CA response
+must match the configured SPIFFE identity. Gateway connection or
+identity verification failures close the proxied connection without direct
+fallback. Only the workload's own certificate is requested.
+
+DNS capture defaults off in this mode; resolving a DNS-named gateway still uses
+the process's resolver. No local TrafficPolicy is installed. Local mode uses a
+fixed Sandbox binding and rejects `ENABLE_SANDBOX_MANAGER`, `XDS_ON_DEMAND`,
+`LOCAL_XDS` and `LOCAL_XDS_PATH`. It does not expose PrepareSandbox or query
+Sandbox/policy configuration. The gateway validates the binding and applies policy.
+Other than certificate renewal and gateway DNS resolution, bootstrap configuration
+is fixed until restart.
+
+### Persistent workload credentials
+
+`WORKLOAD_IDENTITY_DIR=/var/lib/ztunnel/identity` enables persistent instance
+credentials. The first request uses `AUTH_TOKEN`; subsequent CA requests use
+the current workload certificate for mTLS authentication and omit the bootstrap
+Token. The CA must support this authentication flow on the existing
+`IstioCertificateService/CreateCertificate` RPC. This change does not add an
+agentiod authenticator or enrollment endpoint.
+
+In this mode the issued certificate must carry the Agentio WorkloadIdentity
+extension, with a nonempty registry and a UID matching `WORKLOAD_ID`. Its SAN,
+validity and key pair are checked before publishing the credentials. A single
+`identity.json` contains the private key and certificate chain, is written with
+mode 0600, and is replaced atomically. Keep this directory private to the
+workload instance. Restart restores a valid identity without using the Token;
+an expired identity requires a new bootstrap credential. Malformed, mismatched
+or unreadable identity files fail startup instead of being silently replaced.
+Without this setting, existing Token-based renewal remains available.
+
+`DISCOVERY_MODE=xds` is the default and preserves the existing discovery behavior,
+including the development overrides above. In local mode `XDS_ADDRESS` and the
+mesh discovery address do not create a discovery connection; configure
+`CA_ADDRESS` explicitly.
+
 ### In-pod mode setup
 
 Create a netns for your "pod" (in this case, just a network namespace):

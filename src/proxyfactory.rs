@@ -17,7 +17,7 @@ use crate::config;
 use crate::identity::SecretManager;
 use crate::sandbox::sandbox::SandboxManager;
 use crate::sandbox::token::FileSandboxToken;
-use crate::state::{DemandProxyState, WorkloadInfo};
+use crate::state::{DemandProxyState, WorkloadReference};
 use crate::tls;
 use std::sync::Arc;
 use tracing::error;
@@ -120,7 +120,7 @@ impl ProxyFactory {
 
     pub async fn new_proxies_for_dedicated(
         &self,
-        proxy_workload_info: WorkloadInfo,
+        proxy_workload_info: impl Into<WorkloadReference>,
     ) -> Result<ProxyResult, Error> {
         let base = crate::proxy::DefaultSocketFactory(self.config.socket_config);
         let factory: Arc<dyn crate::proxy::SocketFactory + Send + Sync> =
@@ -137,7 +137,7 @@ impl ProxyFactory {
         &self,
         proxy_drain: Option<DrainWatcher>,
         workload_uid: Option<&str>,
-        proxy_workload_info: WorkloadInfo,
+        proxy_workload_info: impl Into<WorkloadReference>,
         socket_factory: Arc<dyn crate::proxy::SocketFactory + Send + Sync>,
     ) -> Result<ProxyResult, Error> {
         let mut result: ProxyResult = Default::default();
@@ -147,7 +147,7 @@ impl ProxyFactory {
         let mut resolver = None;
 
         let local_workload_information = Arc::new(LocalWorkloadInformation::new(
-            Arc::new(proxy_workload_info),
+            proxy_workload_info,
             self.state.clone(),
             self.cert_manager.clone(),
         ));
@@ -196,7 +196,7 @@ impl ProxyFactory {
                 }
                 let mut manager = SandboxManager::new(
                     self.state.clone(),
-                    local_workload_information.workload_info(),
+                    local_workload_information.workload_reference(),
                 )
                 .with_registration(state_directory)?;
                 if self.config.sandbox_token_enabled {
