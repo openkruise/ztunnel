@@ -92,7 +92,7 @@ impl CaServer {
                 PathBuf::from(r"src/test_helpers/fake-jwt"),
                 "Kubernetes".to_string(),
             ),
-            true,
+            crate::identity::CertificateIdentity::Impersonated,
             60 * 60 * 24,
             Vec::new(),
         )

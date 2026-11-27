@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,9 +28,24 @@ use crate::config::RootCert;
 use crate::identity::Identity;
 use crate::identity::auth::AuthSource;
 use crate::identity::{Error, WorkloadIdentity};
+use crate::strng::Strng;
 use crate::tls::{self, RootCertManager, TlsGrpcChannel, control_plane_client_config};
 use crate::xds::istio::ca::IstioCertificateRequest;
 use crate::xds::istio::ca::istio_certificate_service_client::IstioCertificateServiceClient;
+
+#[derive(Clone, Debug)]
+pub enum CertificateIdentity {
+    /// Shared proxies request certificates on behalf of discovered workloads.
+    Impersonated,
+    /// Legacy dedicated proxies let the CA select the authenticated principal.
+    Dedicated,
+    /// An explicit principal, optionally restored and renewed using persisted credentials.
+    Workload {
+        identity: Identity,
+        uid: Strng,
+        directory: Option<PathBuf>,
+    },
+}
 
 pub struct CaClient {
     pub client: std::sync::RwLock<IstioCertificateServiceClient<TlsGrpcChannel>>,
@@ -40,11 +56,10 @@ pub struct CaClient {
     /// Token source for authorization header on gRPC requests
     auth: AuthSource,
     root_cert: RootCert,
-    local_identity: Option<super::local::LocalIdentity>,
+    credentials: Option<super::credentials::WorkloadCredentials>,
     /// Signals when CA root cert file on disk has changed and TLS channel needs to be rebuilt
     root_cert_manager: Option<Arc<RootCertManager>>,
-    pub enable_impersonated_identity: bool,
-    require_identity_match: bool,
+    identity: CertificateIdentity,
     pub secret_ttl: i64,
     ca_headers: Vec<(AsciiMetadataKey, AsciiMetadataValue)>,
 }
@@ -57,13 +72,37 @@ impl CaClient {
         root_cert: RootCert,
         enable_ca_cert_watcher: bool,
         auth: AuthSource,
-        enable_impersonated_identity: bool,
+        identity: CertificateIdentity,
         secret_ttl: i64,
         ca_headers: Vec<(AsciiMetadataKey, AsciiMetadataValue)>,
     ) -> Result<CaClient, Error> {
-        //Build initial TLS ClientConfig from the current root cert
-        let client_config = control_plane_client_config(&root_cert, alt_hostname.clone()).await?;
-        let tls_grpc_channel = tls::grpc_connector(address.clone(), auth.clone(), client_config)?;
+        let credentials = match &identity {
+            CertificateIdentity::Workload {
+                identity,
+                uid,
+                directory: Some(directory),
+            } => Some(
+                super::credentials::WorkloadCredentials::new(
+                    identity.clone(),
+                    uid.clone(),
+                    directory.clone(),
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        let mut client_config =
+            control_plane_client_config(&root_cert, alt_hostname.clone()).await?;
+        let channel_auth = if let Some(resolver) = credentials
+            .as_ref()
+            .and_then(|credentials| credentials.resolver.read().unwrap().clone())
+        {
+            client_config.client_auth_cert_resolver = resolver;
+            AuthSource::None
+        } else {
+            auth.clone()
+        };
+        let tls_grpc_channel = tls::grpc_connector(address.clone(), channel_auth, client_config)?;
         let initial_client = IstioCertificateServiceClient::new(tls_grpc_channel);
 
         let root_cert_manager = (enable_ca_cert_watcher && matches!(root_cert, RootCert::File(_)))
@@ -76,27 +115,12 @@ impl CaClient {
             alt_hostname,
             auth,
             root_cert,
-            local_identity: None,
+            credentials,
             root_cert_manager,
-            enable_impersonated_identity,
-            require_identity_match: enable_impersonated_identity,
+            identity,
             secret_ttl,
             ca_headers,
         })
-    }
-
-    pub(crate) async fn configure_local(
-        &mut self,
-        config: &crate::config::LocalConfig,
-    ) -> Result<(), Error> {
-        self.require_identity_match = true;
-        if let Some(directory) = &config.identity_dir {
-            self.local_identity =
-                Some(super::local::LocalIdentity::new(config, directory.clone()).await?);
-            let client = self.rebuild_channel().await?;
-            *self.client.write().unwrap() = client;
-        }
-        Ok(())
     }
 
     /// Rebuilds gRPC client using the current root cert from disk.
@@ -118,7 +142,7 @@ impl CaClient {
         let mut client_config =
             control_plane_client_config(&root_cert, self.alt_hostname.clone()).await?;
         let resolver = self
-            .local_identity
+            .credentials
             .as_ref()
             .and_then(|local| local.resolver.read().unwrap().clone());
         let auth = if let Some(resolver) = resolver {
@@ -135,7 +159,7 @@ impl CaClient {
 impl CaClient {
     #[instrument(skip_all)]
     async fn fetch_certificate(&self, id: &Identity) -> Result<tls::WorkloadCertificate, Error> {
-        if let Some(local) = &self.local_identity
+        if let Some(local) = &self.credentials
             && let Some(certificate) = local.restored.lock().await.take()
         {
             if certificate.identity().as_ref() != Some(id) {
@@ -185,7 +209,7 @@ impl CaClient {
             validity_duration: self.secret_ttl,
             metadata: {
                 // TODO: Support ambient instance certificates with TargetWorkload and per-instance caching.
-                if self.enable_impersonated_identity {
+                if matches!(self.identity, CertificateIdentity::Impersonated) {
                     Some(Struct {
                         fields: BTreeMap::from([(
                             "ImpersonatedIdentity".into(),
@@ -227,12 +251,14 @@ impl CaClient {
         };
         let certs = tls::WorkloadCertificate::new(&private_key, leaf, chain)?;
         // Make the certificate actually matches the identity we requested.
-        if self.require_identity_match && certs.identity().as_ref() != Some(id) {
+        if !matches!(self.identity, CertificateIdentity::Dedicated)
+            && certs.identity().as_ref() != Some(id)
+        {
             error!("expected identity {:?}, got {:?}", id, certs.identity());
             return Err(Error::SanError(id.to_owned()));
         }
         WorkloadIdentity::from_certificate(&certs.cert.der)?;
-        if let Some(local) = &self.local_identity {
+        if let Some(local) = &self.credentials {
             local.validate(&certs)?;
             let now = std::time::SystemTime::now();
             if certs.cert.expiry.not_before > now || certs.cert.expiry.not_after <= now {
@@ -465,6 +491,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_preserves_ca_selected_identity() {
+        let principal: Identity = "spiffe://cluster.local/workloads/authenticated"
+            .parse()
+            .unwrap();
+        let certs = tls::mock::generate_test_certs(
+            &principal.clone().into(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        let (responses, mut client, requests) = test_helpers::ca::CaServer::spawn().await;
+        client.identity = super::CertificateIdentity::Dedicated;
+        responses
+            .send(Ok(IstioCertificateResponse {
+                cert_chain: certs.full_chain_and_roots(),
+            }))
+            .unwrap();
+        let certificate = client
+            .fetch_certificate(&Identity::default())
+            .await
+            .unwrap();
+        assert_eq!(certificate.identity(), Some(principal));
+        assert!(requests.borrow().as_ref().unwrap().metadata.is_none());
+    }
+
+    #[tokio::test]
     async fn sidecar_workload_identity() {
         let principal = Identity::default();
         let claims = crate::identity::WorkloadIdentity {
@@ -473,7 +524,7 @@ mod tests {
             role: Some("sandbox-attester".into()),
         };
         let (responses, mut client, requests) = test_helpers::ca::CaServer::spawn().await;
-        client.enable_impersonated_identity = false;
+        client.identity = super::CertificateIdentity::Dedicated;
         for expected in [Some(claims), None] {
             let id = match &expected {
                 Some(claims) => {

@@ -338,6 +338,8 @@ pub struct Config {
     /// and the gRPC channel is rebuilt automatically on cert rotation.
     /// Only effective when ca_root_cert is a file path.
     pub ca_cert_watcher: bool,
+    /// Directory for persistent workload credentials and certificate-authenticated renewal.
+    pub workload_identity_dir: Option<PathBuf>,
     // Allow custom alternative CA hostname verification
     pub alt_ca_hostname: Option<String>,
     /// XDS address to use. If unset, XDS will not be used.
@@ -994,6 +996,10 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         ca_address,
         ca_root_cert,
         ca_cert_watcher,
+        workload_identity_dir: match &discovery {
+            DiscoveryConfig::Local(_) => parse("WORKLOAD_IDENTITY_DIR")?,
+            DiscoveryConfig::Xds => None,
+        },
         alt_xds_hostname: parse(ALT_XDS_HOSTNAME)?,
         alt_ca_hostname: parse(ALT_CA_HOSTNAME)?,
 
@@ -1141,8 +1147,7 @@ fn validate_config(cfg: Config) -> Result<Config, Error> {
                 "local mode requires an enabled proxy and PROXY_MODE=dedicated".into(),
             ));
         }
-        if let DiscoveryConfig::Local(local) = &cfg.discovery
-            && let Some(directory) = &local.identity_dir
+        if let Some(directory) = &cfg.workload_identity_dir
             && (directory.as_os_str().is_empty() || !directory.is_absolute() || cfg.fake_ca)
         {
             return Err(Error::InvalidState(

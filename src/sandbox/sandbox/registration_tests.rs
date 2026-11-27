@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::sandbox::discovery::tests::Fixture;
-use crate::state::WorkloadInfo;
+use crate::state::{DemandProxyState, WorkloadInfo};
 use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
 use crate::{proxy, test_helpers, tls, xds};
 use futures_util::FutureExt;
@@ -23,7 +23,7 @@ use tonic::{Code, Status};
 
 fn new_manager(fixture: &Fixture) -> SandboxManager {
     SandboxManager::new(
-        fixture.demand.clone(),
+        Arc::new(fixture.demand.clone()),
         Arc::new(WorkloadInfo::new(
             fixture.workload.name.to_string(),
             fixture.workload.namespace.to_string(),
@@ -114,9 +114,12 @@ async fn restored_identity_waits_for_snapshot_and_checks_binding() {
         Arc::new(proxy::Metrics::new(&mut registry)),
     );
     let manager = Arc::new(
-        SandboxManager::new(state.clone(), new_manager(&fixture).workload.clone())
-            .with_registration(directory.path().into())
-            .unwrap(),
+        SandboxManager::new(
+            Arc::new(state.clone()),
+            new_manager(&fixture).workload.clone(),
+        )
+        .with_registration(directory.path().into())
+        .unwrap(),
     );
     assert!(!state.supports_on_demand(&xds::ADDRESS_TYPE));
     assert!(state.supports_on_demand(&xds::SANDBOX_TYPE));

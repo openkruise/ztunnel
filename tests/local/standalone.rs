@@ -194,10 +194,7 @@ async fn control_plane(
     config.ca_address = Some(format!("https://{address}"));
     config.ca_root_cert = RootCert::Static(tls::mock::TEST_ROOT.into());
     config.auth = AuthSource::StaticToken("bootstrap-token".into(), "agentio".into());
-    let DiscoveryConfig::Local(local) = &mut config.discovery else {
-        unreachable!()
-    };
-    local.identity_dir = directory.map(Into::into);
+    config.workload_identity_dir = directory.map(Into::into);
     (config, rx, state)
 }
 
@@ -259,10 +256,41 @@ async fn local_csr_rejects_an_unexpected_san_without_impersonation() {
 }
 
 #[tokio::test]
+async fn sandbox_lookup_uses_explicit_query_configuration() {
+    use ztunnel::sandbox::lookup::{GetSandboxLookup, SandboxLookup};
+    use ztunnel::state::WorkloadReference;
+    let (mut config, mut requests, state) = control_plane(None, false).await;
+    config.enable_sandbox_manager = true;
+    let query = config.sandbox_query_config().unwrap();
+    config.discovery = DiscoveryConfig::Xds;
+    let manager = Arc::new(SecretManager::new(Arc::new(config)).await.unwrap());
+    let lookup = GetSandboxLookup::new(query, manager).unwrap();
+    *state.response.write().unwrap() = Ok(binding(
+        "sandbox-123",
+        "instance-123",
+        Duration::from_secs(60),
+    ));
+    let id = "sandbox-123".into();
+    let workload = WorkloadReference::Uid("instance-123".into());
+    let sandbox = lookup.fetch(&id, &workload).await.unwrap();
+    assert_eq!(sandbox.uid, id);
+    assert!(requests.recv().await.unwrap());
+    assert_eq!(state.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(lookup.cached(&id, &workload).unwrap().unwrap().uid, id);
+    assert!(matches!(
+        lookup.cached(&id, &WorkloadReference::Uid("other-instance".into())),
+        Err(ztunnel::sandbox::sandbox::Error::WorkloadMismatch)
+    ));
+    assert_eq!(state.queries.load(Ordering::SeqCst), 1);
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn sandbox_query_reconnects_with_the_renewed_workload_certificate() {
     use ztunnel::sandbox::lookup::{GetSandboxLookup, SandboxLookup};
     let directory = tempfile::tempdir().unwrap();
-    let (config, mut requests, state) = control_plane(Some(directory.path()), false).await;
+    let (mut config, mut requests, state) = control_plane(Some(directory.path()), false).await;
+    config.enable_sandbox_manager = true;
     *state.response.write().unwrap() = Ok(binding(
         "sandbox-123",
         "instance-123",
@@ -273,12 +301,13 @@ async fn sandbox_query_reconnects_with_the_renewed_workload_certificate() {
     let identity = SOURCE.parse().unwrap();
     let first = manager.fetch_certificate(&identity).await.unwrap();
     assert!(requests.recv().await.unwrap());
-    let DiscoveryConfig::Local(local) = &config.discovery else {
-        unreachable!()
-    };
     let lookup =
-        GetSandboxLookup::new(config.clone(), local.as_ref().clone(), manager.clone()).unwrap();
-    lookup.fetch(&"sandbox-123".into()).await.unwrap();
+        GetSandboxLookup::new(config.sandbox_query_config().unwrap(), manager.clone()).unwrap();
+    let workload = ztunnel::state::WorkloadReference::Uid("instance-123".into());
+    lookup
+        .fetch(&"sandbox-123".into(), &workload)
+        .await
+        .unwrap();
     assert_eq!(state.query_certificates.lock().unwrap()[0], first.cert.der);
     assert!(
         !timeout(Duration::from_secs(6), requests.recv())
@@ -293,7 +322,10 @@ async fn sandbox_query_reconnects_with_the_renewed_workload_certificate() {
     )
     .await;
     let renewed = manager.fetch_certificate(&identity).await.unwrap();
-    lookup.fetch(&"sandbox-123".into()).await.unwrap();
+    lookup
+        .fetch(&"sandbox-123".into(), &workload)
+        .await
+        .unwrap();
     assert_eq!(
         state.query_certificates.lock().unwrap()[1],
         renewed.cert.der

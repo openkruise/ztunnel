@@ -19,7 +19,6 @@ use std::fmt::{self, Formatter};
 use std::hash::{Hash, RandomState};
 use std::sync::Arc;
 
-use crate::config::ProxyMode;
 use async_trait::async_trait;
 
 use tokio::sync::{Mutex, mpsc, watch};
@@ -443,7 +442,7 @@ impl fmt::Debug for SecretManager {
 
 impl SecretManager {
     pub async fn new(cfg: Arc<crate::config::Config>) -> Result<Self, Error> {
-        let mut caclient = CaClient::new(
+        let caclient = CaClient::new(
             cfg.ca_address
                 .clone()
                 .expect("ca_address must be set to use CA"),
@@ -451,14 +450,11 @@ impl SecretManager {
             cfg.ca_root_cert.clone(),
             cfg.ca_cert_watcher,
             cfg.auth.clone(),
-            cfg.proxy_mode == ProxyMode::Shared,
+            cfg.certificate_identity(),
             cfg.secret_ttl.as_secs().try_into().unwrap_or(60 * 60 * 24),
             cfg.ca_headers.vec.clone(),
         )
         .await?;
-        if let crate::config::DiscoveryConfig::Local(local) = &cfg.discovery {
-            caclient.configure_local(local).await?;
-        }
         Ok(Self::new_with_client(caclient))
     }
 

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::str::FromStr;
 
 use hyper::http::uri::Authority;
 
-use super::Error;
-use crate::identity::Identity;
+use super::{Config, Error, ProxyMode};
+use crate::identity::{CertificateIdentity, Identity};
+use crate::sandbox::lookup::SandboxQueryConfig;
 use crate::strng::Strng;
 
 const DISCOVERY_MODE: &str = "DISCOVERY_MODE";
@@ -46,7 +46,6 @@ pub struct LocalConfig {
     pub identity: Identity,
     pub gateway: LocalGateway,
     pub sandbox_id: Option<Strng>,
-    pub identity_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -108,7 +107,6 @@ pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
                     identity: required(EGRESS_GATEWAY_IDENTITY)?,
                 },
                 sandbox_id: sandbox_id.map(Into::into),
-                identity_dir: super::parse("WORKLOAD_IDENTITY_DIR")?,
             })))
         }
         Some(value) => Err(Error::EnvVar(
@@ -116,6 +114,41 @@ pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
             value.into(),
             "expected xds or local".into(),
         )),
+    }
+}
+
+impl Config {
+    pub fn certificate_identity(&self) -> CertificateIdentity {
+        match &self.discovery {
+            DiscoveryConfig::Local(local) => CertificateIdentity::Workload {
+                identity: local.identity.clone(),
+                uid: local.workload_id.clone(),
+                directory: self.workload_identity_dir.clone(),
+            },
+            DiscoveryConfig::Xds if self.proxy_mode == ProxyMode::Shared => {
+                CertificateIdentity::Impersonated
+            }
+            DiscoveryConfig::Xds => CertificateIdentity::Dedicated,
+        }
+    }
+
+    pub fn sandbox_query_config(&self) -> Option<SandboxQueryConfig> {
+        match &self.discovery {
+            DiscoveryConfig::Local(local) if self.enable_sandbox_manager => {
+                Some(SandboxQueryConfig {
+                    address: self
+                        .ca_address
+                        .clone()
+                        .expect("local Sandbox queries require a CA address"),
+                    root_cert: self.ca_root_cert.clone(),
+                    alt_hostname: self.alt_ca_hostname.clone(),
+                    watch_root_cert: self.ca_cert_watcher,
+                    identity: local.identity.clone(),
+                    node_id: format!("ztunnel~{}~{}~", local.workload_ip, local.workload_id),
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -171,9 +204,26 @@ mod tests {
                 return;
             }
             let config = result.unwrap();
-            if case == "default" || case == "xds" {
+            if matches!(
+                case.as_str(),
+                "default" | "xds" | "xds-manager" | "xds-dedicated" | "xds-identity-dir"
+            ) {
                 assert!(matches!(config.discovery, DiscoveryConfig::Xds));
-                assert_eq!(config.proxy_mode, ProxyMode::Shared);
+                if case == "xds-dedicated" {
+                    assert_eq!(config.proxy_mode, ProxyMode::Dedicated);
+                    assert!(matches!(
+                        config.certificate_identity(),
+                        CertificateIdentity::Dedicated
+                    ));
+                } else {
+                    assert_eq!(config.proxy_mode, ProxyMode::Shared);
+                    assert!(matches!(
+                        config.certificate_identity(),
+                        CertificateIdentity::Impersonated
+                    ));
+                }
+                assert!(config.workload_identity_dir.is_none());
+                assert!(config.sandbox_query_config().is_none());
                 assert!(config.xds_address.is_some());
                 assert!(config.dns_proxy);
             } else {
@@ -198,6 +248,26 @@ mod tests {
                     local.sandbox_id.as_deref(),
                     (case == "sandbox").then_some("sandbox-123")
                 );
+                let CertificateIdentity::Workload {
+                    identity,
+                    uid,
+                    directory,
+                } = config.certificate_identity()
+                else {
+                    panic!("expected workload certificate identity");
+                };
+                assert_eq!(identity, local.identity);
+                assert_eq!(uid, local.workload_id);
+                assert_eq!(directory, config.workload_identity_dir);
+                assert_eq!(directory.is_some(), case == "identity-dir");
+                let query = config.sandbox_query_config();
+                assert_eq!(query.is_some(), case == "manager");
+                if let Some(query) = query {
+                    assert_eq!(query.address, "https://ca.example:15012");
+                    assert_eq!(query.identity, local.identity);
+                    assert_eq!(query.node_id, "ztunnel~127.0.0.1~vm-123~");
+                    assert_eq!(query.watch_root_cert, config.ca_cert_watcher);
+                }
             }
             return;
         }
@@ -205,6 +275,9 @@ mod tests {
         let cases = [
             ("default", "DISCOVERY_MODE", None, None),
             ("xds", "DISCOVERY_MODE", Some("xds"), None),
+            ("xds-manager", "DISCOVERY_MODE", Some("xds"), None),
+            ("xds-dedicated", "DISCOVERY_MODE", Some("xds"), None),
+            ("xds-identity-dir", "DISCOVERY_MODE", Some("xds"), None),
             ("local", "DISCOVERY_MODE", Some("local"), None),
             ("sandbox", "SANDBOX_ID", Some("sandbox-123"), None),
             ("pod-metadata", "PROXY_WORKLOAD_INFO", Some("unused"), None),
@@ -359,6 +432,16 @@ mod tests {
             }
             if case == "manager-with-id" {
                 command.env("SANDBOX_ID", "sandbox-123");
+            }
+            if case == "xds-manager" {
+                command.env("ENABLE_SANDBOX_MANAGER", "true");
+            }
+            if case == "xds-dedicated" {
+                command.env("PROXY_MODE", "dedicated");
+                command.env("PROXY_WORKLOAD_INFO", "default/local/default");
+            }
+            if case == "xds-identity-dir" {
+                command.env("WORKLOAD_IDENTITY_DIR", "unused-relative-path");
             }
             if matches!(case, "fake-ca-with-identity" | "fake-ca-with-manager") {
                 command.env("FAKE_CA", "true");

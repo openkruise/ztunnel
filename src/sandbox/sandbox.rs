@@ -23,7 +23,7 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use super::lookup::SandboxLookup;
 use crate::sandbox::discovery::{Sandbox, validate_id};
-use crate::state::{DemandProxyState, WorkloadReference};
+use crate::state::WorkloadReference;
 use crate::strng::{self, Strng};
 
 use super::metadata::SandboxMetadata;
@@ -91,7 +91,6 @@ pub(crate) struct SandboxContext {
 
 /// Manages one workload proxy's Sandbox identity, token and policy readiness.
 pub struct SandboxManager {
-    state: DemandProxyState,
     lookup: Arc<dyn SandboxLookup>,
     workload: WorkloadReference,
     pub(crate) token: Option<FileSandboxToken>,
@@ -103,10 +102,9 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    pub fn new(state: DemandProxyState, workload: impl Into<WorkloadReference>) -> Self {
+    pub fn new(lookup: Arc<dyn SandboxLookup>, workload: impl Into<WorkloadReference>) -> Self {
         Self {
-            lookup: Arc::new(state.clone()),
-            state,
+            lookup,
             workload: workload.into(),
             token: None,
             directory: None,
@@ -114,11 +112,6 @@ impl SandboxManager {
             registration_lock: Mutex::new(()),
             fetch_lock: AsyncMutex::new(()),
         }
-    }
-
-    pub fn with_lookup(mut self, lookup: Arc<dyn SandboxLookup>) -> Self {
-        self.lookup = lookup;
-        self
     }
 
     pub fn with_registration(mut self, directory: PathBuf) -> Result<Self, Error> {
@@ -233,22 +226,11 @@ impl SandboxManager {
     /// Registration remains separate so failed or cancelled waits do not persist an ID.
     pub(crate) async fn wait_for_sandbox(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
         tokio::time::timeout(READY_TIMEOUT, async {
-            // Start Sandbox demand before waiting for local Workload discovery.
-            self.fetch_sandbox(id).await?;
-            self.state
-                .wait_for_workload(&self.workload, READY_TIMEOUT)
-                .await
-                .ok_or(Error::UnknownWorkload)?;
-            // Use the current snapshot after waiting, including on restart recovery.
-            self.get_sandbox(id)
+            let _fetch = self.fetch_lock.lock().await;
+            self.lookup.fetch(id, &self.workload).await
         })
         .await
         .map_err(|_| Error::NotReady)?
-    }
-
-    async fn fetch_sandbox(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
-        let _fetch = self.fetch_lock.lock().await;
-        self.lookup.fetch(id).await
     }
 
     /// Check local state only. Preparation and recovery own demand and waiting.

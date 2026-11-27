@@ -23,7 +23,7 @@ pub use workload_identity::*;
 mod spiffe;
 pub use spiffe::Identity;
 
-mod local;
+mod credentials;
 
 mod caclient;
 pub use caclient::*;

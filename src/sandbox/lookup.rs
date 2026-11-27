@@ -21,8 +21,8 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use super::{discovery::Sandbox, sandbox::Error};
-use crate::config::{Config, LocalConfig, RootCert};
-use crate::identity::{AuthSource, SecretManager};
+use crate::config::RootCert;
+use crate::identity::{AuthSource, Identity, SecretManager};
 use crate::state::{DemandProxyState, WorkloadReference};
 use crate::strng::Strng;
 use crate::tls::{self, RootCertManager, TlsGrpcChannel};
@@ -33,7 +33,7 @@ use crate::xds::agentio::sandbox::{
 /// Preparation may perform I/O; connection selection only reads an accepted snapshot.
 #[async_trait]
 pub trait SandboxLookup: Send + Sync {
-    async fn fetch(&self, id: &Strng) -> Result<Arc<Sandbox>, Error>;
+    async fn fetch(&self, id: &Strng, workload: &WorkloadReference) -> Result<Arc<Sandbox>, Error>;
     fn cached(
         &self,
         id: &Strng,
@@ -47,29 +47,32 @@ pub trait SandboxLookup: Send + Sync {
 
 #[async_trait]
 impl SandboxLookup for DemandProxyState {
-    async fn fetch(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
+    async fn fetch(&self, id: &Strng, workload: &WorkloadReference) -> Result<Arc<Sandbox>, Error> {
         let current = || {
             self.read()
                 .sandboxes
                 .get(id)
                 .filter(|s| s.workload_uid.is_some())
         };
-        if let Some(sandbox) = current() {
-            return Ok(sandbox);
-        }
-        let mut changes = self.read().policies.subscribe();
-        let demand = self.fetch_on_demand(crate::xds::SANDBOX_TYPE, id.clone());
-        tokio::pin!(demand);
-        let mut responded = false;
-        loop {
-            if let Some(sandbox) = current() {
-                return Ok(sandbox);
+        if current().is_none() {
+            let mut changes = self.read().policies.subscribe();
+            let demand = self.fetch_on_demand(crate::xds::SANDBOX_TYPE, id.clone());
+            tokio::pin!(demand);
+            let mut responded = false;
+            loop {
+                if current().is_some() {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut demand, if !responded => responded = true,
+                    result = changes.changed() => { result?; }
+                }
             }
-            tokio::select! {
-                _ = &mut demand, if !responded => responded = true,
-                result = changes.changed() => { result?; }
-            }
         }
+        self.wait_for_workload(workload, super::sandbox::READY_TIMEOUT)
+            .await
+            .ok_or(Error::UnknownWorkload)?;
+        self.cached(id, workload)?.ok_or(Error::NotReady)
     }
 
     fn cached(
@@ -97,10 +100,18 @@ struct CachedSandbox {
 
 type QueryClient = SandboxQueryServiceClient<TlsGrpcChannel>;
 
+pub struct SandboxQueryConfig {
+    pub address: String,
+    pub root_cert: RootCert,
+    pub alt_hostname: Option<String>,
+    pub watch_root_cert: bool,
+    pub identity: Identity,
+    pub node_id: String,
+}
+
 /// Queries agentiod using the workload certificate; no platform credentials or ADS stream.
 pub struct GetSandboxLookup {
-    config: Arc<Config>,
-    local: LocalConfig,
+    config: SandboxQueryConfig,
     certificates: Arc<SecretManager>,
     roots: Option<Arc<RootCertManager>>,
     client: Mutex<Option<(Arc<tls::WorkloadCertificate>, QueryClient)>>,
@@ -109,16 +120,14 @@ pub struct GetSandboxLookup {
 
 impl GetSandboxLookup {
     pub fn new(
-        config: Arc<Config>,
-        local: LocalConfig,
+        config: SandboxQueryConfig,
         certificates: Arc<SecretManager>,
     ) -> Result<Self, crate::identity::Error> {
-        let roots = (config.ca_cert_watcher && matches!(config.ca_root_cert, RootCert::File(_)))
-            .then(|| RootCertManager::new(config.ca_root_cert.clone()))
+        let roots = (config.watch_root_cert && matches!(config.root_cert, RootCert::File(_)))
+            .then(|| RootCertManager::new(config.root_cert.clone()))
             .transpose()?;
         Ok(Self {
             config,
-            local,
             certificates,
             roots,
             client: Mutex::new(None),
@@ -129,7 +138,7 @@ impl GetSandboxLookup {
     async fn client(&self) -> Result<QueryClient, Error> {
         let certificate = self
             .certificates
-            .fetch_certificate(&self.local.identity)
+            .fetch_certificate(&self.config.identity)
             .await?;
         let mut cached = self.client.lock().await;
         let dirty = self.roots.as_ref().is_some_and(|r| r.take_dirty());
@@ -141,19 +150,13 @@ impl GetSandboxLookup {
         }
         let result = async {
             let mut config = tls::control_plane_client_config(
-                &self.config.ca_root_cert,
-                self.config.alt_ca_hostname.clone(),
+                &self.config.root_cert,
+                self.config.alt_hostname.clone(),
             )
             .await?;
             config.client_auth_cert_resolver = certificate.client_cert_resolver()?;
-            let channel = tls::grpc_connector(
-                self.config
-                    .ca_address
-                    .clone()
-                    .expect("local mode requires a CA address"),
-                AuthSource::None,
-                config,
-            )?;
+            let channel =
+                tls::grpc_connector(self.config.address.clone(), AuthSource::None, config)?;
             Ok::<_, tls::Error>(QueryClient::new(channel))
         }
         .await;
@@ -173,13 +176,10 @@ impl GetSandboxLookup {
 
 #[async_trait]
 impl SandboxLookup for GetSandboxLookup {
-    async fn fetch(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
+    async fn fetch(&self, id: &Strng, workload: &WorkloadReference) -> Result<Arc<Sandbox>, Error> {
         let mut request = tonic::Request::new(GetSandboxRequest {
             name: id.to_string(),
-            node_id: format!(
-                "ztunnel~{}~{}~",
-                self.local.workload_ip, self.local.workload_id
-            ),
+            node_id: self.config.node_id.clone(),
             node_metadata: None,
         });
         request.set_timeout(super::sandbox::READY_TIMEOUT);
@@ -224,8 +224,7 @@ impl SandboxLookup for GetSandboxLookup {
                 refresh: now + ttl / 2,
             },
         );
-        self.cached(id, &WorkloadReference::Uid(self.local.workload_id.clone()))?
-            .ok_or(Error::NotReady)
+        self.cached(id, workload)?.ok_or(Error::NotReady)
     }
 
     fn cached(

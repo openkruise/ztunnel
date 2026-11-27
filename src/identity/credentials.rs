@@ -17,11 +17,11 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 use super::{Error, Identity, WorkloadIdentity};
-use crate::{config::LocalConfig, tls};
+use crate::{strng::Strng, tls};
 
-pub(super) struct LocalIdentity {
+pub(super) struct WorkloadCredentials {
     identity: Identity,
-    uid: crate::strng::Strng,
+    uid: Strng,
     path: PathBuf,
     pub restored: tokio::sync::Mutex<Option<tls::WorkloadCertificate>>,
     pub resolver: std::sync::RwLock<Option<Arc<dyn rustls::client::ResolvesClientCert>>>,
@@ -33,11 +33,11 @@ struct Credentials {
     cert_chain: Vec<String>,
 }
 
-impl LocalIdentity {
-    pub async fn new(config: &LocalConfig, directory: PathBuf) -> Result<Self, Error> {
+impl WorkloadCredentials {
+    pub async fn new(identity: Identity, uid: Strng, directory: PathBuf) -> Result<Self, Error> {
         let local = Self {
-            identity: config.identity.clone(),
-            uid: config.workload_id.clone(),
+            identity,
+            uid,
             path: directory.join("identity.json"),
             restored: tokio::sync::Mutex::new(None),
             resolver: std::sync::RwLock::new(None),
@@ -51,7 +51,7 @@ impl LocalIdentity {
         let (leaf, chain) = credentials
             .cert_chain
             .split_first()
-            .ok_or_else(|| Error::EmptyResponse(config.identity.clone()))?;
+            .ok_or_else(|| Error::EmptyResponse(local.identity.clone()))?;
         let certificate = tls::WorkloadCertificate::new(
             credentials.private_key.as_bytes(),
             leaf.as_bytes(),
@@ -125,30 +125,19 @@ impl LocalIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalGateway;
     use crate::tls::mock::{TestIdentity, generate_test_certs};
     use std::time::Duration;
 
-    fn config() -> LocalConfig {
-        LocalConfig {
-            workload_id: "instance-123".into(),
-            workload_ip: "127.0.0.1".parse().unwrap(),
-            identity: "spiffe://example.org/instances/instance-123"
-                .parse()
-                .unwrap(),
-            gateway: LocalGateway {
-                address: "127.0.0.1:15008".parse().unwrap(),
-                identity: "spiffe://example.org/gateways/egress".parse().unwrap(),
-            },
-            sandbox_id: None,
-            identity_dir: None,
-        }
+    fn identity() -> Identity {
+        "spiffe://example.org/instances/instance-123"
+            .parse()
+            .unwrap()
     }
 
-    fn certificate(config: &LocalConfig, uid: &str) -> tls::WorkloadCertificate {
+    fn certificate(identity: &Identity, uid: &str) -> tls::WorkloadCertificate {
         generate_test_certs(
             &TestIdentity::Workload(
-                config.identity.clone(),
+                identity.clone(),
                 WorkloadIdentity {
                     registry: "local".into(),
                     uid: uid.into(),
@@ -163,17 +152,25 @@ mod tests {
     #[tokio::test]
     async fn credentials_round_trip_and_validate_identity() {
         let directory = tempfile::tempdir().unwrap();
-        let config = config();
-        let local = LocalIdentity::new(&config, directory.path().into())
-            .await
-            .unwrap();
+        let identity = identity();
+        let local = WorkloadCredentials::new(
+            identity.clone(),
+            "instance-123".into(),
+            directory.path().into(),
+        )
+        .await
+        .unwrap();
         assert!(local.restored.lock().await.is_none());
-        let cert = certificate(&config, "instance-123");
+        let cert = certificate(&identity, "instance-123");
         local.validate(&cert).unwrap();
         local.store(&cert).await.unwrap();
-        let restored = LocalIdentity::new(&config, directory.path().into())
-            .await
-            .unwrap();
+        let restored = WorkloadCredentials::new(
+            identity.clone(),
+            "instance-123".into(),
+            directory.path().into(),
+        )
+        .await
+        .unwrap();
         let restored = restored.restored.lock().await.take().unwrap();
         assert_eq!(restored.cert.der, cert.cert.der);
         assert_eq!(
@@ -190,21 +187,18 @@ mod tests {
         }
         assert!(
             local
-                .validate(&certificate(&config, "other-instance"))
+                .validate(&certificate(&identity, "other-instance"))
                 .is_err()
         );
         let missing = generate_test_certs(
-            &config.identity.clone().into(),
+            &identity.clone().into(),
             Duration::ZERO,
             Duration::from_secs(60),
         );
         assert!(local.validate(&missing).is_err());
-        let other = LocalConfig {
-            identity: "spiffe://example.org/instances/other".parse().unwrap(),
-            ..config
-        };
+        let other = "spiffe://example.org/instances/other".parse().unwrap();
         assert!(
-            LocalIdentity::new(&other, directory.path().into())
+            WorkloadCredentials::new(other, "instance-123".into(), directory.path().into())
                 .await
                 .is_err()
         );
@@ -213,17 +207,21 @@ mod tests {
     #[tokio::test]
     async fn corrupt_or_mismatched_keys_fail_without_bootstrap_fallback() {
         let directory = tempfile::tempdir().unwrap();
-        let config = config();
-        let local = LocalIdentity::new(&config, directory.path().into())
-            .await
-            .unwrap();
-        let first = certificate(&config, "instance-123");
+        let identity = identity();
+        let local = WorkloadCredentials::new(
+            identity.clone(),
+            "instance-123".into(),
+            directory.path().into(),
+        )
+        .await
+        .unwrap();
+        let first = certificate(&identity, "instance-123");
         local.store(&first).await.unwrap();
         let mut stored: Credentials =
             serde_json::from_slice(&std::fs::read(&local.path).unwrap()).unwrap();
         stored.private_key = String::from_utf8(
             tls::csr::CsrOptions {
-                san: config.identity.to_string(),
+                san: identity.to_string(),
             }
             .generate()
             .unwrap()
@@ -232,13 +230,22 @@ mod tests {
         .unwrap();
         std::fs::write(&local.path, serde_json::to_vec(&stored).unwrap()).unwrap();
         assert!(
-            LocalIdentity::new(&config, directory.path().into())
-                .await
-                .is_err()
+            WorkloadCredentials::new(
+                identity.clone(),
+                "instance-123".into(),
+                directory.path().into()
+            )
+            .await
+            .is_err()
         );
         std::fs::write(&local.path, "invalid json").unwrap();
         assert!(matches!(
-            LocalIdentity::new(&config, directory.path().into()).await,
+            WorkloadCredentials::new(
+                identity.clone(),
+                "instance-123".into(),
+                directory.path().into()
+            )
+            .await,
             Err(Error::Json(_))
         ));
     }
@@ -246,16 +253,20 @@ mod tests {
     #[tokio::test]
     async fn expired_credentials_require_bootstrap_again() {
         let directory = tempfile::tempdir().unwrap();
-        let config = config();
-        let local = LocalIdentity::new(&config, directory.path().into())
-            .await
-            .unwrap();
+        let identity = identity();
+        let local = WorkloadCredentials::new(
+            identity.clone(),
+            "instance-123".into(),
+            directory.path().into(),
+        )
+        .await
+        .unwrap();
         let expired = generate_test_certs(
             &TestIdentity::Workload(
-                config.identity.clone(),
+                identity.clone(),
                 WorkloadIdentity {
                     registry: "local".into(),
-                    uid: config.workload_id.clone(),
+                    uid: "instance-123".into(),
                     role: None,
                 },
             ),
@@ -263,9 +274,13 @@ mod tests {
             Duration::ZERO,
         );
         local.store(&expired).await.unwrap();
-        let restored = LocalIdentity::new(&config, directory.path().into())
-            .await
-            .unwrap();
+        let restored = WorkloadCredentials::new(
+            identity.clone(),
+            "instance-123".into(),
+            directory.path().into(),
+        )
+        .await
+        .unwrap();
         assert!(restored.restored.lock().await.is_none());
         assert!(restored.resolver.read().unwrap().is_none());
         assert!(local.path.is_file());

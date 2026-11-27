@@ -53,7 +53,6 @@ fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
             identity: GATEWAY.parse().unwrap(),
         },
         sandbox_id: sandbox.map(Into::into),
-        identity_dir: None,
     };
     config.proxy_workload_information = None;
     config.discovery = DiscoveryConfig::Local(Box::new(local));

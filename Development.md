@@ -106,6 +106,15 @@ SPIFFE paths as opaque; TLS still checks the trust domain and the expected peer
 identity. Certificate acquisition, renewal, HBONE forwarding and connection
 pools are shared by both modes. Existing xDS wire formats remain compatible.
 
+Discovery is selected at the shared entry point. Configuration resolves the
+certificate identity and optional Sandbox query settings before constructing
+their clients. The CA client consumes `CertificateIdentity`, independently of
+the discovery source; credential storage receives only a principal, workload
+UID and directory. The Get adapter receives a `SandboxQueryConfig` containing
+its endpoint, trust settings, principal and node ID. It does not read the
+process configuration or gateway routes. `SandboxManager` consumes only
+`SandboxLookup`; each adapter owns source-specific discovery and binding checks.
+
 Local mode defaults to `PROXY_MODE=dedicated` and binds listeners in the process's
 current network namespace. The external runtime owns network setup and transparent
 traffic redirection. Its rules must exempt ztunnel's own traffic, including CA and

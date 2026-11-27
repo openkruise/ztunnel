@@ -37,9 +37,11 @@ pub async fn build_with_cert(
     config: Arc<config::Config>,
     cert_manager: Arc<SecretManager>,
 ) -> anyhow::Result<Bound> {
-    if let config::DiscoveryConfig::Local(local) = &config.discovery {
+    if let crate::identity::CertificateIdentity::Workload { identity, .. } =
+        config.certificate_identity()
+    {
         cert_manager
-            .fetch_certificate(&local.identity)
+            .fetch_certificate(&identity)
             .await
             .context("fetch local workload certificate")?;
     }

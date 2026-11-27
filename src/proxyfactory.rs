@@ -15,6 +15,7 @@
 
 use crate::config;
 use crate::identity::SecretManager;
+use crate::sandbox::lookup::{GetSandboxLookup, SandboxLookup};
 use crate::sandbox::sandbox::SandboxManager;
 use crate::sandbox::token::FileSandboxToken;
 use crate::state::{DemandProxyState, WorkloadReference};
@@ -35,6 +36,7 @@ use crate::proxy::{Error, LocalWorkloadInformation, Metrics};
 pub struct ProxyFactory {
     config: Arc<config::Config>,
     state: DemandProxyState,
+    sandbox_lookup: Arc<dyn SandboxLookup>,
     cert_manager: Arc<SecretManager>,
     proxy_metrics: Arc<Metrics>,
     dns_metrics: Option<Arc<dns::Metrics>>,
@@ -105,9 +107,17 @@ impl ProxyFactory {
             None
         };
 
+        let sandbox_lookup: Arc<dyn SandboxLookup> = match config.sandbox_query_config() {
+            Some(query) => Arc::new(
+                GetSandboxLookup::new(query, cert_manager.clone())
+                    .map_err(std::io::Error::other)?,
+            ),
+            None => Arc::new(state.clone()),
+        };
         Ok(ProxyFactory {
             config,
             state,
+            sandbox_lookup,
             cert_manager,
             proxy_metrics,
             dns_metrics,
@@ -195,19 +205,10 @@ impl ProxyFactory {
                     state_directory.push(uid);
                 }
                 let mut manager = SandboxManager::new(
-                    self.state.clone(),
+                    self.sandbox_lookup.clone(),
                     local_workload_information.workload_reference(),
                 )
                 .with_registration(state_directory)?;
-                if let config::DiscoveryConfig::Local(local) = &self.config.discovery {
-                    manager = manager.with_lookup(Arc::new(
-                        crate::sandbox::lookup::GetSandboxLookup::new(
-                            self.config.clone(),
-                            local.as_ref().clone(),
-                            self.cert_manager.clone(),
-                        )?,
-                    ));
-                }
                 if self.config.sandbox_token_enabled {
                     let mut token_directory =
                         std::path::PathBuf::from(&self.config.sandbox_token_path);
