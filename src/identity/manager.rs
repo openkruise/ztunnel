@@ -443,7 +443,7 @@ impl fmt::Debug for SecretManager {
 
 impl SecretManager {
     pub async fn new(cfg: Arc<crate::config::Config>) -> Result<Self, Error> {
-        let caclient = CaClient::new(
+        let mut caclient = CaClient::new(
             cfg.ca_address
                 .clone()
                 .expect("ca_address must be set to use CA"),
@@ -456,6 +456,9 @@ impl SecretManager {
             cfg.ca_headers.vec.clone(),
         )
         .await?;
+        if let crate::config::DiscoveryConfig::Local(local) = &cfg.discovery {
+            caclient.configure_local(local).await?;
+        }
         Ok(Self::new_with_client(caclient))
     }
 

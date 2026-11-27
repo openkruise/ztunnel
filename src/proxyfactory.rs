@@ -199,6 +199,15 @@ impl ProxyFactory {
                     local_workload_information.workload_reference(),
                 )
                 .with_registration(state_directory)?;
+                if let config::DiscoveryConfig::Local(local) = &self.config.discovery {
+                    manager = manager.with_lookup(Arc::new(
+                        crate::sandbox::lookup::GetSandboxLookup::new(
+                            self.config.clone(),
+                            local.as_ref().clone(),
+                            self.cert_manager.clone(),
+                        )?,
+                    ));
+                }
                 if self.config.sandbox_token_enabled {
                     let mut token_directory =
                         std::path::PathBuf::from(&self.config.sandbox_token_path);

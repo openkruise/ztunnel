@@ -158,7 +158,11 @@ impl From<Error> for Status {
                 Code::FailedPrecondition
             }
             Error::NotReady => Code::DeadlineExceeded,
-            Error::UnknownWorkload | Error::UpdateChannelClosed(_) => Code::Unavailable,
+            Error::UnknownWorkload
+            | Error::UpdateChannelClosed(_)
+            | Error::LookupUnavailable(_)
+            | Error::Query(_)
+            | Error::Identity(_) => Code::Unavailable,
             Error::Io(_) | Error::Json(_) | Error::TokenLoad(_) | Error::RegistrationTask(_) => {
                 Code::Internal
             }

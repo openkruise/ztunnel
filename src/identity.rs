@@ -23,6 +23,8 @@ pub use workload_identity::*;
 mod spiffe;
 pub use spiffe::Identity;
 
+mod local;
+
 mod caclient;
 pub use caclient::*;
 
@@ -43,6 +45,10 @@ pub mod mock {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {
+    #[error("local identity I/O error: {0}")]
+    Io(#[from] Arc<std::io::Error>),
+    #[error("invalid local identity file: {0}")]
+    Json(#[from] Arc<serde_json::Error>),
     #[error("workload identity: {0}")]
     WorkloadIdentity(String),
     #[error("failed to create CSR: {0}")]

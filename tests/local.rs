@@ -39,13 +39,13 @@ use ztunnel::xds::istio::ca::istio_certificate_service_server::{
 };
 use ztunnel::xds::istio::ca::{IstioCertificateRequest, IstioCertificateResponse};
 
-const SOURCE: &str = "spiffe://cluster.local/workloads/vm-123";
+const SOURCE: &str = "spiffe://cluster.local/workloads/instance-123";
 const GATEWAY: &str = "spiffe://cluster.local/gateways/porter";
 
 fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
     let mut config = test_config();
     let local = LocalConfig {
-        workload_id: "vm-123".into(),
+        workload_id: "instance-123".into(),
         workload_ip: "127.0.0.2".parse().unwrap(),
         identity: SOURCE.parse().unwrap(),
         gateway: LocalGateway {
@@ -53,6 +53,7 @@ fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
             identity: GATEWAY.parse().unwrap(),
         },
         sandbox_id: sandbox.map(Into::into),
+        identity_dir: None,
     };
     config.proxy_workload_information = None;
     config.discovery = DiscoveryConfig::Local(Box::new(local));
@@ -267,35 +268,50 @@ impl IstioCertificateService for Authority {
         if let Some(gate) = &self.issuance_gate {
             gate.notified().await;
         }
-        let mut csr = rcgen::CertificateSigningRequestParams::from_pem(&request.csr).unwrap();
-        assert_eq!(
-            csr.params.subject_alt_names,
-            vec![rcgen::SanType::URI(SOURCE.try_into().unwrap())]
-        );
-        let now = time::OffsetDateTime::now_utc();
-        csr.params.not_before = now - time::Duration::seconds(1);
-        csr.params.not_after = now + time::Duration::seconds(6);
-        csr.params.extended_key_usages = vec![
-            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-        ];
-        let key = rcgen::KeyPair::from_pem(std::str::from_utf8(tls::mock::TEST_ROOT_KEY).unwrap())
-            .unwrap();
-        let issuer = rcgen::Issuer::from_ca_cert_pem(
-            std::str::from_utf8(tls::mock::TEST_ROOT).unwrap(),
-            key,
-        )
-        .unwrap();
-        let certificate = csr.signed_by(&issuer).unwrap();
-        Ok(Response::new(IstioCertificateResponse {
-            cert_chain: vec![
-                certificate.pem(),
-                std::str::from_utf8(tls::mock::TEST_ROOT)
-                    .unwrap()
-                    .to_string(),
-            ],
-        }))
+        sign_csr(&request.csr, None, false)
     }
+}
+
+fn sign_csr(
+    csr: &str,
+    claims: Option<&ztunnel::identity::WorkloadIdentity>,
+    wrong_san: bool,
+) -> Result<Response<IstioCertificateResponse>, Status> {
+    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr).unwrap();
+    assert_eq!(
+        csr.params.subject_alt_names,
+        vec![rcgen::SanType::URI(SOURCE.try_into().unwrap())]
+    );
+    if wrong_san {
+        csr.params.subject_alt_names = vec![rcgen::SanType::URI(GATEWAY.try_into().unwrap())];
+    }
+    if let Some(claims) = claims {
+        csr.params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 57874, 5, 1],
+            serde_json::to_vec(claims).unwrap(),
+        )];
+    }
+    let now = time::OffsetDateTime::now_utc();
+    csr.params.not_before = now - time::Duration::seconds(1);
+    csr.params.not_after = now + time::Duration::seconds(6);
+    csr.params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+    ];
+    let key =
+        rcgen::KeyPair::from_pem(std::str::from_utf8(tls::mock::TEST_ROOT_KEY).unwrap()).unwrap();
+    let issuer =
+        rcgen::Issuer::from_ca_cert_pem(std::str::from_utf8(tls::mock::TEST_ROOT).unwrap(), key)
+            .unwrap();
+    let certificate = csr.signed_by(&issuer).unwrap();
+    Ok(Response::new(IstioCertificateResponse {
+        cert_chain: vec![
+            certificate.pem(),
+            std::str::from_utf8(tls::mock::TEST_ROOT)
+                .unwrap()
+                .to_string(),
+        ],
+    }))
 }
 
 async fn control_plane(
@@ -448,3 +464,6 @@ async fn local_startup_waits_for_the_first_certificate() {
     let (result, ()) = tokio::join!(app.wait_termination(), shutdown.shutdown_now());
     result.unwrap();
 }
+
+#[path = "local/standalone.rs"]
+mod standalone;

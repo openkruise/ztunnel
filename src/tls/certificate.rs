@@ -279,7 +279,7 @@ impl WorkloadCertificate {
 
     // TODO: can we precompute some or all of this?
 
-    pub(in crate::tls) fn cert_and_intermediates_der(&self) -> Vec<CertificateDer<'static>> {
+    pub(crate) fn cert_and_intermediates_der(&self) -> Vec<CertificateDer<'static>> {
         std::iter::once(self.cert.der.clone())
             .chain(self.chain.iter().map(|x| x.der.clone()))
             .collect()
@@ -297,6 +297,21 @@ impl WorkloadCertificate {
             .map(|c| c.as_pem())
             .chain(iter::once(self.roots.iter().map(|c| c.as_pem()).join("\n")))
             .collect()
+    }
+
+    pub(crate) fn private_key_pem(&self) -> String {
+        der_to_pem(self.private_key.secret_der(), "PRIVATE KEY")
+    }
+
+    pub(crate) fn client_cert_resolver(
+        &self,
+    ) -> Result<Arc<dyn rustls::client::ResolvesClientCert>, Error> {
+        let key = rustls::sign::CertifiedKey::from_der(
+            self.cert_and_intermediates_der(),
+            self.private_key.clone_key(),
+            &crate::tls::lib::provider(),
+        )?;
+        Ok(Arc::new(rustls::sign::SingleCertAndKey::from(key)))
     }
 
     pub fn server_config(

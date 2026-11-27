@@ -30,6 +30,7 @@ fn main() -> Result<(), anyhow::Error> {
         "proto/sandbox_network.proto",
         "proto/extensions.proto",
         "proto/api/sandbox/v1/sandbox.proto",
+        "proto/api/sandbox/v1/query.proto",
         "proto/api/security/v1/trafficpolicy.proto",
     ]
     .iter()

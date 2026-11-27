@@ -62,8 +62,8 @@ The gateway applies policy.
 
 ```shell
 DISCOVERY_MODE=local \
-WORKLOAD_ID=vm-123 \
-WORKLOAD_IDENTITY=spiffe://agentio.local/workloads/vm-123 \
+WORKLOAD_ID=instance-123 \
+WORKLOAD_IDENTITY=spiffe://agentio.local/workloads/instance-123 \
 INSTANCE_IP=10.0.0.10 \
 SANDBOX_ID=sandbox-123 \
 EGRESS_GATEWAY_ADDRESS=egress.example.com:15008 \
@@ -79,11 +79,13 @@ AUTH_TOKEN=/run/agentio/bootstrap.token \
 | `WORKLOAD_ID` | Required stable identifier of the local workload. |
 | `WORKLOAD_IDENTITY` | Required SPIFFE identity for the workload certificate. |
 | `INSTANCE_IP` | Workload IP; defaults to `127.0.0.1`. |
-| `SANDBOX_ID` | Optional Sandbox UID bound to this workload and included in HBONE requests. |
+| `SANDBOX_ID` | Optional fixed Sandbox UID included in HBONE requests; mutually exclusive with `ENABLE_SANDBOX_MANAGER`. |
 | `EGRESS_GATEWAY_ADDRESS` | Required IP or DNS hostname with a nonzero port; IPv6 uses `[address]:port`. |
 | `EGRESS_GATEWAY_IDENTITY` | Required SPIFFE identity expected in the gateway certificate. |
 | `CA_ADDRESS` | Required certificate service endpoint. |
 | `CA_ROOT_CA`, `AUTH_TOKEN`, `SECRET_TTL` | Existing CA trust, bootstrap credential and requested certificate lifetime settings. |
+| `WORKLOAD_IDENTITY_DIR` | Optional absolute directory for the instance certificate and private key; enables certificate authentication for subsequent CA requests. |
+| `ENABLE_SANDBOX_MANAGER` | Enables preparation after startup using agentiod's Sandbox Get RPC instead of a fixed `SANDBOX_ID`. |
 
 Identities are complete SPIFFE URIs; their paths do not require a namespace or
 ServiceAccount. `WORKLOAD_ID` selects the local workload by UID independently of
@@ -111,16 +113,65 @@ gateway connections, for example by process UID. Merely starting the listener do
 not capture application traffic.
 
 Startup obtains the first workload certificate before starting the proxy.
-Certificate renewal uses the existing secret manager. Gateway connection or
+Certificate renewal uses the existing secret manager. Every local CA response
+must match the configured SPIFFE identity. Gateway connection or
 identity verification failures close the proxied connection without direct
 fallback. Only the workload's own certificate is requested.
 
 DNS capture defaults off in this mode; resolving a DNS-named gateway still uses
 the process's resolver. No local TrafficPolicy is installed. Local mode uses a
-fixed Sandbox binding rather than the xDS-dependent Sandbox manager, and rejects
-`ENABLE_SANDBOX_MANAGER`, `XDS_ON_DEMAND`, `LOCAL_XDS` and `LOCAL_XDS_PATH`.
+fixed Sandbox binding by default, and rejects `XDS_ON_DEMAND`, `LOCAL_XDS` and
+`LOCAL_XDS_PATH`.
 Other than certificate renewal and gateway DNS resolution, bootstrap configuration
 is fixed until restart.
+
+### Standalone workload credentials and preparation
+
+`WORKLOAD_IDENTITY_DIR=/var/lib/ztunnel/identity` enables persistent instance
+credentials. The first request uses `AUTH_TOKEN`; subsequent CA requests use
+the current workload certificate for mTLS authentication and omit the bootstrap
+Token. The CA must support this authentication flow on the existing
+`IstioCertificateService/CreateCertificate` RPC. This change does not add an
+agentiod authenticator or enrollment endpoint.
+
+In this mode the issued certificate must carry the Agentio WorkloadIdentity
+extension, with a nonempty registry and a UID matching `WORKLOAD_ID`. Its SAN,
+validity and key pair are checked before publishing the credentials. A single
+`identity.json` contains the private key and certificate chain, is written with
+mode 0600, and is replaced atomically. Keep this directory private to the
+workload instance. Restart restores a valid identity without using the Token;
+an expired identity requires a new bootstrap credential. Malformed, mismatched
+or unreadable identity files fail startup instead of being silently replaced.
+Without this setting, existing Token-based renewal remains available.
+
+For preparation after a workload has already started, omit `SANDBOX_ID` and set
+`ENABLE_SANDBOX_MANAGER=true`. The proxy becomes ready after obtaining its own
+certificate and starting its listeners, without querying Sandbox configuration.
+A trusted launcher then calls the existing `SandboxNetwork/PrepareSandbox` RPC.
+The management endpoint retains its existing loopback/mTLS configuration; use
+the management mTLS identity allowlist when exposing it beyond the trusted host.
+
+Local preparation calls `SandboxQueryService/GetSandbox` at `CA_ADDRESS` using
+the workload certificate and `CA_ROOT_CA`; it requires a real CA endpoint and
+cannot be combined with `FAKE_CA`. The request selects the Sandbox UID;
+the response must use the same UID and bind it to this workload. The query
+protocol is shared with the Agentio Sandbox Get clients. agentiod still needs
+to authenticate and authorize the standalone workload and resolve its scope.
+ztunnel does not contact the external Sandbox source itself or enforce the
+gateway's inline policies.
+
+The Get adapter requires a positive `cache_ttl`, refreshes at half its lifetime,
+and reuses its TLS connection until credentials or trust roots change. New
+connections only read the cached binding. An unbound, expired or differently
+bound registered Sandbox blocks new connections; transient query errors retain
+the previous binding only until its TTL expires. Already established connections
+are not terminated by a binding update. Prepare confirms local preparation, not
+gateway/EPE readiness. A registration survives process restart and is revalidated
+through Get. A different Sandbox ID still requires a fresh proxy registration;
+pool recycling and explicit unbinding are outside this change.
+
+The default xDS preparation path uses the same `SandboxLookup` interface and
+continues consuming accepted push/on-demand resources without TTL polling.
 
 `DISCOVERY_MODE=xds` is the default and preserves the existing discovery behavior,
 including the development overrides above. In local mode `XDS_ADDRESS` and the

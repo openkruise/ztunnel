@@ -1141,9 +1141,30 @@ fn validate_config(cfg: Config) -> Result<Config, Error> {
                 "local mode requires an enabled proxy and PROXY_MODE=dedicated".into(),
             ));
         }
-        if cfg.local_xds_config.is_some() || cfg.xds_on_demand || cfg.enable_sandbox_manager {
+        if let DiscoveryConfig::Local(local) = &cfg.discovery
+            && let Some(directory) = &local.identity_dir
+            && (directory.as_os_str().is_empty() || !directory.is_absolute() || cfg.fake_ca)
+        {
             return Err(Error::InvalidState(
-                "local mode does not support LOCAL_XDS, LOCAL_XDS_PATH, XDS_ON_DEMAND or ENABLE_SANDBOX_MANAGER".into(),
+                "WORKLOAD_IDENTITY_DIR requires an absolute path and a real CA".into(),
+            ));
+        }
+        if cfg.local_xds_config.is_some() || cfg.xds_on_demand {
+            return Err(Error::InvalidState(
+                "local mode does not support LOCAL_XDS, LOCAL_XDS_PATH or XDS_ON_DEMAND".into(),
+            ));
+        }
+        if let DiscoveryConfig::Local(local) = &cfg.discovery
+            && local.sandbox_id.is_some()
+            && cfg.enable_sandbox_manager
+        {
+            return Err(Error::InvalidState(
+                "local SANDBOX_ID and ENABLE_SANDBOX_MANAGER are mutually exclusive".into(),
+            ));
+        }
+        if cfg.enable_sandbox_manager && cfg.ca_address.is_none() {
+            return Err(Error::InvalidState(
+                "local ENABLE_SANDBOX_MANAGER requires CA_ADDRESS and a real CA".into(),
             ));
         }
     }
@@ -1159,7 +1180,10 @@ fn validate_config(cfg: Config) -> Result<Config, Error> {
             "{SANDBOX_MANAGEMENT_TLS_ENABLED} requires {ENABLE_SANDBOX_MANAGER} and a nonempty {SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES}"
         )));
     }
-    if cfg.enable_sandbox_manager && (!cfg.proxy || cfg.xds_address.is_none()) {
+    if cfg.enable_sandbox_manager
+        && (!cfg.proxy
+            || (matches!(cfg.discovery, DiscoveryConfig::Xds) && cfg.xds_address.is_none()))
+    {
         return Err(Error::InvalidState(format!(
             "{ENABLE_SANDBOX_MANAGER} requires an enabled proxy and an xDS server"
         )));

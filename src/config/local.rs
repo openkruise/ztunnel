@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use hyper::http::uri::Authority;
@@ -45,6 +46,7 @@ pub struct LocalConfig {
     pub identity: Identity,
     pub gateway: LocalGateway,
     pub sandbox_id: Option<Strng>,
+    pub identity_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -106,6 +108,7 @@ pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
                     identity: required(EGRESS_GATEWAY_IDENTITY)?,
                 },
                 sandbox_id: sandbox_id.map(Into::into),
+                identity_dir: super::parse("WORKLOAD_IDENTITY_DIR")?,
             })))
         }
         Some(value) => Err(Error::EnvVar(
@@ -179,6 +182,7 @@ mod tests {
                 };
                 assert_eq!(config.proxy_mode, ProxyMode::Dedicated);
                 assert!(config.proxy_workload_information.is_none());
+                assert_eq!(config.enable_sandbox_manager, case == "manager");
                 assert_eq!(local.workload_id, "vm-123");
                 assert_eq!(
                     local.identity.to_string(),
@@ -204,6 +208,42 @@ mod tests {
             ("local", "DISCOVERY_MODE", Some("local"), None),
             ("sandbox", "SANDBOX_ID", Some("sandbox-123"), None),
             ("pod-metadata", "PROXY_WORKLOAD_INFO", Some("unused"), None),
+            (
+                "identity-dir",
+                "WORKLOAD_IDENTITY_DIR",
+                Some("/var/lib/ztunnel/identity"),
+                None,
+            ),
+            (
+                "relative-identity-dir",
+                "WORKLOAD_IDENTITY_DIR",
+                Some("identity"),
+                Some("WORKLOAD_IDENTITY_DIR"),
+            ),
+            (
+                "empty-identity-dir",
+                "WORKLOAD_IDENTITY_DIR",
+                Some(""),
+                Some("WORKLOAD_IDENTITY_DIR"),
+            ),
+            (
+                "fake-ca-with-identity",
+                "WORKLOAD_IDENTITY_DIR",
+                Some("/var/lib/ztunnel/identity"),
+                Some("WORKLOAD_IDENTITY_DIR"),
+            ),
+            (
+                "manager-with-id",
+                "ENABLE_SANDBOX_MANAGER",
+                Some("true"),
+                Some("mutually exclusive"),
+            ),
+            (
+                "fake-ca-with-manager",
+                "ENABLE_SANDBOX_MANAGER",
+                Some("true"),
+                Some("requires CA_ADDRESS"),
+            ),
             (
                 "xds-address",
                 "XDS_ADDRESS",
@@ -288,12 +328,7 @@ mod tests {
                 Some("true"),
                 Some("XDS_ON_DEMAND"),
             ),
-            (
-                "manager",
-                "ENABLE_SANDBOX_MANAGER",
-                Some("true"),
-                Some("ENABLE_SANDBOX_MANAGER"),
-            ),
+            ("manager", "ENABLE_SANDBOX_MANAGER", Some("true"), None),
         ];
         for (case, name, value, expected_error) in cases {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -321,6 +356,12 @@ mod tests {
                 command.env(name, value);
             } else {
                 command.env_remove(name);
+            }
+            if case == "manager-with-id" {
+                command.env("SANDBOX_ID", "sandbox-123");
+            }
+            if matches!(case, "fake-ca-with-identity" | "fake-ca-with-manager") {
+                command.env("FAKE_CA", "true");
             }
             if let Some(error) = expected_error {
                 command.env("ZTUNNEL_EXPECT_CONFIG_ERROR", error);

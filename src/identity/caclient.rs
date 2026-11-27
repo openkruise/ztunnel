@@ -39,9 +39,12 @@ pub struct CaClient {
     alt_hostname: Option<String>,
     /// Token source for authorization header on gRPC requests
     auth: AuthSource,
+    root_cert: RootCert,
+    local_identity: Option<super::local::LocalIdentity>,
     /// Signals when CA root cert file on disk has changed and TLS channel needs to be rebuilt
     root_cert_manager: Option<Arc<RootCertManager>>,
     pub enable_impersonated_identity: bool,
+    require_identity_match: bool,
     pub secret_ttl: i64,
     ca_headers: Vec<(AsciiMetadataKey, AsciiMetadataValue)>,
 }
@@ -72,11 +75,28 @@ impl CaClient {
             address,
             alt_hostname,
             auth,
+            root_cert,
+            local_identity: None,
             root_cert_manager,
             enable_impersonated_identity,
+            require_identity_match: enable_impersonated_identity,
             secret_ttl,
             ca_headers,
         })
+    }
+
+    pub(crate) async fn configure_local(
+        &mut self,
+        config: &crate::config::LocalConfig,
+    ) -> Result<(), Error> {
+        self.require_identity_match = true;
+        if let Some(directory) = &config.identity_dir {
+            self.local_identity =
+                Some(super::local::LocalIdentity::new(config, directory.clone()).await?);
+            let client = self.rebuild_channel().await?;
+            *self.client.write().unwrap() = client;
+        }
+        Ok(())
     }
 
     /// Rebuilds gRPC client using the current root cert from disk.
@@ -92,13 +112,22 @@ impl CaClient {
         let root_cert = self
             .root_cert_manager
             .as_ref()
-            .expect("rebuild_channel requires root_cert_manager to be Some")
-            .root_cert();
+            .map(|manager| manager.root_cert())
+            .unwrap_or_else(|| self.root_cert.clone());
 
-        let client_config =
+        let mut client_config =
             control_plane_client_config(&root_cert, self.alt_hostname.clone()).await?;
-        let tls_grpc_channel =
-            tls::grpc_connector(self.address.clone(), self.auth.clone(), client_config)?;
+        let resolver = self
+            .local_identity
+            .as_ref()
+            .and_then(|local| local.resolver.read().unwrap().clone());
+        let auth = if let Some(resolver) = resolver {
+            client_config.client_auth_cert_resolver = resolver;
+            AuthSource::None
+        } else {
+            self.auth.clone()
+        };
+        let tls_grpc_channel = tls::grpc_connector(self.address.clone(), auth, client_config)?;
         Ok(IstioCertificateServiceClient::new(tls_grpc_channel))
     }
 }
@@ -106,6 +135,14 @@ impl CaClient {
 impl CaClient {
     #[instrument(skip_all)]
     async fn fetch_certificate(&self, id: &Identity) -> Result<tls::WorkloadCertificate, Error> {
+        if let Some(local) = &self.local_identity
+            && let Some(certificate) = local.restored.lock().await.take()
+        {
+            if certificate.identity().as_ref() != Some(id) {
+                return Err(Error::SanError(id.clone()));
+            }
+            return Ok(certificate);
+        }
         // Hot reload check
         // If the cert has changed since last call, rebuild the channel before making the request.
         // If rebuild fails:
@@ -190,11 +227,25 @@ impl CaClient {
         };
         let certs = tls::WorkloadCertificate::new(&private_key, leaf, chain)?;
         // Make the certificate actually matches the identity we requested.
-        if self.enable_impersonated_identity && certs.identity().as_ref() != Some(id) {
+        if self.require_identity_match && certs.identity().as_ref() != Some(id) {
             error!("expected identity {:?}, got {:?}", id, certs.identity());
             return Err(Error::SanError(id.to_owned()));
         }
         WorkloadIdentity::from_certificate(&certs.cert.der)?;
+        if let Some(local) = &self.local_identity {
+            local.validate(&certs)?;
+            let now = std::time::SystemTime::now();
+            if certs.cert.expiry.not_before > now || certs.cert.expiry.not_after <= now {
+                return Err(Error::WorkloadIdentity(
+                    "issued instance certificate is not currently valid".into(),
+                ));
+            }
+            let resolver = certs.client_cert_resolver()?;
+            local.store(&certs).await?;
+            *local.resolver.write().unwrap() = Some(resolver);
+            let client = self.rebuild_channel().await?;
+            *self.client.write().unwrap() = client;
+        }
         Ok(certs)
     }
 }
