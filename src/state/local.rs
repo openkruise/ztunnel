@@ -75,12 +75,10 @@ pub(super) fn build(config: &Config, local: &LocalConfig) -> ProxyState {
             }),
         }],
     });
-    if let Some(uid) = &local.sandbox_id {
-        state.sandboxes.insert(Sandbox {
-            uid: uid.clone(),
-            workload_uid: Some(source.uid.clone()),
-        });
-    }
+    state.sandboxes.insert(Sandbox {
+        uid: local.sandbox_id.clone(),
+        workload_uid: Some(source.uid.clone()),
+    });
     state.workloads.insert(Arc::new(source));
     state.workloads.insert(Arc::new(gateway));
     state

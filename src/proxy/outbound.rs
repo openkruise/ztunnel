@@ -1016,7 +1016,7 @@ mod tests {
         let token_dir = directory.path().join("tokens");
         std::fs::create_dir_all(&token_dir).unwrap();
         std::fs::write(token_dir.join("sandbox.token"), TEST_SANDBOX_TOKEN).unwrap();
-        let mut manager = sandbox::SandboxManager::new(Arc::new(state.clone()), Arc::new(wi));
+        let mut manager = sandbox::SandboxManager::new(state.clone(), Arc::new(wi));
         manager = manager
             .with_registration(directory.path().join("state"))
             .unwrap();

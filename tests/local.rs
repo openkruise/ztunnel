@@ -42,7 +42,7 @@ use ztunnel::xds::istio::ca::{IstioCertificateRequest, IstioCertificateResponse}
 const SOURCE: &str = "spiffe://cluster.local/workloads/instance-123";
 const GATEWAY: &str = "spiffe://cluster.local/gateways/porter";
 
-fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
+fn local_config(gateway: SocketAddr, sandbox: &str) -> Config {
     let mut config = test_config();
     let local = LocalConfig {
         workload_id: "instance-123".into(),
@@ -52,7 +52,7 @@ fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
             address: gateway.to_string().parse().unwrap(),
             identity: GATEWAY.parse().unwrap(),
         },
-        sandbox_id: sandbox.map(Into::into),
+        sandbox_id: sandbox.into(),
     };
     config.proxy_workload_information = None;
     config.discovery = DiscoveryConfig::Local(Box::new(local));
@@ -148,9 +148,9 @@ async fn local_hbone_preserves_original_destination_sandbox_and_identity() {
     )]))
     .await
     .unwrap();
-    for sandbox in [None, Some("sandbox-123")] {
-        let mut config = local_config(gateway, sandbox);
-        if sandbox.is_some() {
+    for hostname in [false, true] {
+        let mut config = local_config(gateway, "sandbox-123");
+        if hostname {
             let DiscoveryConfig::Local(local) = &mut config.discovery else {
                 unreachable!();
             };
@@ -186,7 +186,7 @@ async fn local_hbone_preserves_original_destination_sandbox_and_identity() {
         for target in ["203.0.113.7:443", "[2001:db8::7]:8443"] {
             let request = requests.recv().await.unwrap();
             assert_eq!(request.destination, target);
-            assert_eq!(request.sandbox.as_deref(), sandbox);
+            assert_eq!(request.sandbox.as_deref(), Some("sandbox-123"));
             assert_eq!(request.identity, SOURCE);
         }
     }
@@ -198,7 +198,7 @@ async fn local_gateway_failures_do_not_fall_back_to_direct_connections() {
     for wrong_identity in [false, true] {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (gateway, _requests) = gateway().await;
-        let mut config = local_config(gateway, Some("sandbox-123"));
+        let mut config = local_config(gateway, "sandbox-123");
         let DiscoveryConfig::Local(local) = &mut config.discovery else {
             unreachable!();
         };
@@ -361,7 +361,7 @@ async fn control_plane(
             });
         }
     });
-    let mut config = local_config("127.0.0.1:15008".parse().unwrap(), None);
+    let mut config = local_config("127.0.0.1:15008".parse().unwrap(), "sandbox-123");
     config.fake_ca = false;
     config.secret_ttl = Duration::from_secs(6);
     config.ca_address = Some(format!("https://{address}"));
@@ -403,7 +403,9 @@ async fn local_csr_renews_without_opening_ads() {
         .unwrap()
         .unwrap();
     assert_eq!(&received, b"csr-to-hbone");
-    assert_eq!(forwarded.recv().await.unwrap().identity, SOURCE);
+    let forwarded = forwarded.recv().await.unwrap();
+    assert_eq!(forwarded.identity, SOURCE);
+    assert_eq!(forwarded.sandbox.as_deref(), Some("sandbox-123"));
     drop(stream);
     let renewal = timeout(Duration::from_secs(6), requests.recv())
         .await

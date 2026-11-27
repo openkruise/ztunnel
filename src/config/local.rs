@@ -19,7 +19,6 @@ use hyper::http::uri::Authority;
 
 use super::{Config, Error, ProxyMode};
 use crate::identity::{CertificateIdentity, Identity};
-use crate::sandbox::lookup::SandboxQueryConfig;
 use crate::strng::Strng;
 
 const DISCOVERY_MODE: &str = "DISCOVERY_MODE";
@@ -45,7 +44,7 @@ pub struct LocalConfig {
     pub workload_ip: IpAddr,
     pub identity: Identity,
     pub gateway: LocalGateway,
-    pub sandbox_id: Option<Strng>,
+    pub sandbox_id: Strng,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -93,11 +92,9 @@ pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
             if workload_id.is_empty() {
                 return Err(Error::InvalidState("WORKLOAD_ID must not be empty".into()));
             }
-            let sandbox_id = super::parse::<String>(SANDBOX_ID)?;
-            if let Some(id) = &sandbox_id {
-                crate::sandbox::discovery::validate_id(id)
-                    .map_err(|error| Error::InvalidState(error.to_string()))?;
-            }
+            let sandbox_id: String = required(SANDBOX_ID)?;
+            crate::sandbox::discovery::validate_id(&sandbox_id)
+                .map_err(|error| Error::InvalidState(error.to_string()))?;
             Ok(DiscoveryConfig::Local(Box::new(LocalConfig {
                 workload_id: workload_id.into(),
                 workload_ip: super::parse(INSTANCE_IP)?.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -106,7 +103,7 @@ pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
                     address: required(EGRESS_GATEWAY_ADDRESS)?,
                     identity: required(EGRESS_GATEWAY_IDENTITY)?,
                 },
-                sandbox_id: sandbox_id.map(Into::into),
+                sandbox_id: sandbox_id.into(),
             })))
         }
         Some(value) => Err(Error::EnvVar(
@@ -129,25 +126,6 @@ impl Config {
                 CertificateIdentity::Impersonated
             }
             DiscoveryConfig::Xds => CertificateIdentity::Dedicated,
-        }
-    }
-
-    pub fn sandbox_query_config(&self) -> Option<SandboxQueryConfig> {
-        match &self.discovery {
-            DiscoveryConfig::Local(local) if self.enable_sandbox_manager => {
-                Some(SandboxQueryConfig {
-                    address: self
-                        .ca_address
-                        .clone()
-                        .expect("local Sandbox queries require a CA address"),
-                    root_cert: self.ca_root_cert.clone(),
-                    alt_hostname: self.alt_ca_hostname.clone(),
-                    watch_root_cert: self.ca_cert_watcher,
-                    identity: local.identity.clone(),
-                    node_id: format!("ztunnel~{}~{}~", local.workload_ip, local.workload_id),
-                })
-            }
-            _ => None,
         }
     }
 }
@@ -223,7 +201,6 @@ mod tests {
                     ));
                 }
                 assert!(config.workload_identity_dir.is_none());
-                assert!(config.sandbox_query_config().is_none());
                 assert!(config.xds_address.is_some());
                 assert!(config.dns_proxy);
             } else {
@@ -232,7 +209,7 @@ mod tests {
                 };
                 assert_eq!(config.proxy_mode, ProxyMode::Dedicated);
                 assert!(config.proxy_workload_information.is_none());
-                assert_eq!(config.enable_sandbox_manager, case == "manager");
+                assert!(!config.enable_sandbox_manager);
                 assert_eq!(local.workload_id, "vm-123");
                 assert_eq!(
                     local.identity.to_string(),
@@ -244,10 +221,7 @@ mod tests {
                     config.ca_address.as_deref(),
                     Some("https://ca.example:15012")
                 );
-                assert_eq!(
-                    local.sandbox_id.as_deref(),
-                    (case == "sandbox").then_some("sandbox-123")
-                );
+                assert_eq!(local.sandbox_id, "sandbox-123");
                 let CertificateIdentity::Workload {
                     identity,
                     uid,
@@ -260,14 +234,6 @@ mod tests {
                 assert_eq!(uid, local.workload_id);
                 assert_eq!(directory, config.workload_identity_dir);
                 assert_eq!(directory.is_some(), case == "identity-dir");
-                let query = config.sandbox_query_config();
-                assert_eq!(query.is_some(), case == "manager");
-                if let Some(query) = query {
-                    assert_eq!(query.address, "https://ca.example:15012");
-                    assert_eq!(query.identity, local.identity);
-                    assert_eq!(query.node_id, "ztunnel~127.0.0.1~vm-123~");
-                    assert_eq!(query.watch_root_cert, config.ca_cert_watcher);
-                }
             }
             return;
         }
@@ -279,7 +245,8 @@ mod tests {
             ("xds-dedicated", "DISCOVERY_MODE", Some("xds"), None),
             ("xds-identity-dir", "DISCOVERY_MODE", Some("xds"), None),
             ("local", "DISCOVERY_MODE", Some("local"), None),
-            ("sandbox", "SANDBOX_ID", Some("sandbox-123"), None),
+            ("missing-sandbox", "SANDBOX_ID", None, Some("SANDBOX_ID")),
+            ("empty-sandbox", "SANDBOX_ID", Some(""), Some("Sandbox uid")),
             ("pod-metadata", "PROXY_WORKLOAD_INFO", Some("unused"), None),
             (
                 "identity-dir",
@@ -304,18 +271,6 @@ mod tests {
                 "WORKLOAD_IDENTITY_DIR",
                 Some("/var/lib/ztunnel/identity"),
                 Some("WORKLOAD_IDENTITY_DIR"),
-            ),
-            (
-                "manager-with-id",
-                "ENABLE_SANDBOX_MANAGER",
-                Some("true"),
-                Some("mutually exclusive"),
-            ),
-            (
-                "fake-ca-with-manager",
-                "ENABLE_SANDBOX_MANAGER",
-                Some("true"),
-                Some("requires CA_ADDRESS"),
             ),
             (
                 "xds-address",
@@ -401,7 +356,12 @@ mod tests {
                 Some("true"),
                 Some("XDS_ON_DEMAND"),
             ),
-            ("manager", "ENABLE_SANDBOX_MANAGER", Some("true"), None),
+            (
+                "manager",
+                "ENABLE_SANDBOX_MANAGER",
+                Some("true"),
+                Some("ENABLE_SANDBOX_MANAGER"),
+            ),
         ];
         for (case, name, value, expected_error) in cases {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -415,6 +375,7 @@ mod tests {
                 .env(CASE, case)
                 .env("DISCOVERY_MODE", "local")
                 .env("WORKLOAD_ID", "vm-123")
+                .env("SANDBOX_ID", "sandbox-123")
                 .env(
                     "WORKLOAD_IDENTITY",
                     "spiffe://agentio.local/workloads/vm-123",
@@ -430,9 +391,6 @@ mod tests {
             } else {
                 command.env_remove(name);
             }
-            if case == "manager-with-id" {
-                command.env("SANDBOX_ID", "sandbox-123");
-            }
             if case == "xds-manager" {
                 command.env("ENABLE_SANDBOX_MANAGER", "true");
             }
@@ -443,7 +401,7 @@ mod tests {
             if case == "xds-identity-dir" {
                 command.env("WORKLOAD_IDENTITY_DIR", "unused-relative-path");
             }
-            if matches!(case, "fake-ca-with-identity" | "fake-ca-with-manager") {
+            if case == "fake-ca-with-identity" {
                 command.env("FAKE_CA", "true");
             }
             if let Some(error) = expected_error {

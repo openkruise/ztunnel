@@ -21,10 +21,10 @@ use std::time::Duration;
 use http::HeaderValue;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
-use super::lookup::SandboxLookup;
 use crate::sandbox::discovery::{Sandbox, validate_id};
-use crate::state::WorkloadReference;
+use crate::state::{DemandProxyState, WorkloadReference};
 use crate::strng::{self, Strng};
+use crate::xds::SANDBOX_TYPE;
 
 use super::metadata::SandboxMetadata;
 use super::token::FileSandboxToken;
@@ -39,12 +39,6 @@ const PREPARATION_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Sandbox lookup unavailable: {0}")]
-    LookupUnavailable(String),
-    #[error("Sandbox query RPC: {0}")]
-    Query(#[from] Box<tonic::Status>),
-    #[error("Sandbox query authentication: {0}")]
-    Identity(#[from] crate::identity::Error),
     #[error("invalid Sandbox identity: {0}")]
     InvalidIdentity(#[source] anyhow::Error),
     #[error("Sandbox registration I/O error: {0}")]
@@ -91,10 +85,10 @@ pub(crate) struct SandboxContext {
 
 /// Manages one workload proxy's Sandbox identity, token and policy readiness.
 pub struct SandboxManager {
-    lookup: Arc<dyn SandboxLookup>,
+    state: DemandProxyState,
     workload: WorkloadReference,
     pub(crate) token: Option<FileSandboxToken>,
-    // Only identity is persisted. Readiness comes from the configured lookup source.
+    // Only identity is persisted. Readiness is checked against the current xDS snapshot.
     directory: Option<PathBuf>,
     id: watch::Sender<Option<Strng>>,
     registration_lock: Mutex<()>,
@@ -102,9 +96,9 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    pub fn new(lookup: Arc<dyn SandboxLookup>, workload: impl Into<WorkloadReference>) -> Self {
+    pub fn new(state: DemandProxyState, workload: impl Into<WorkloadReference>) -> Self {
         Self {
-            lookup,
+            state,
             workload: workload.into(),
             token: None,
             directory: None,
@@ -151,24 +145,13 @@ impl SandboxManager {
 
     /// Runs with the proxy's management listener and is cancelled on drain.
     pub(crate) async fn run(self: &Arc<Self>) {
-        let mut registrations = self.id.subscribe();
         let id = self.registered_id().await;
         loop {
-            if let Some(delay) = self.lookup.refresh_after(&id) {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {},
-                    _ = registrations.changed() => continue,
-                }
-            }
             match self.wait_for_sandbox(&id).await {
-                Ok(_) if self.lookup.refresh_after(&id).is_none() => return,
-                Ok(_) => {}
+                Ok(_) => return,
                 Err(error) => {
-                    tracing::warn!(%error, "Sandbox preparation or refresh pending");
-                    tokio::select! {
-                        _ = tokio::time::sleep(PREPARATION_RETRY) => {},
-                        _ = registrations.changed() => {},
-                    }
+                    tracing::warn!(%error, "Sandbox restoration pending; traffic uses Workload policies");
+                    tokio::time::sleep(PREPARATION_RETRY).await;
                 }
             }
         }
@@ -191,7 +174,6 @@ impl SandboxManager {
         // Another Prepare may have committed while this request waited for readiness.
         self.check_registration(id)?;
         if self.id.borrow().is_some() {
-            self.id.send_replace(Some(strng::new(id)));
             return Ok(());
         }
         let directory = self.directory.as_ref().expect("registration configured");
@@ -226,11 +208,52 @@ impl SandboxManager {
     /// Registration remains separate so failed or cancelled waits do not persist an ID.
     pub(crate) async fn wait_for_sandbox(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
         tokio::time::timeout(READY_TIMEOUT, async {
-            let _fetch = self.fetch_lock.lock().await;
-            self.lookup.fetch(id, &self.workload).await
+            // Start Sandbox demand before waiting for local Workload discovery.
+            self.fetch_sandbox(id).await?;
+            self.state
+                .wait_for_workload(&self.workload, READY_TIMEOUT)
+                .await
+                .ok_or(Error::UnknownWorkload)?;
+            // Use the current snapshot after waiting, including on restart recovery.
+            self.get_sandbox(id)
         })
         .await
         .map_err(|_| Error::NotReady)?
+    }
+
+    async fn fetch_sandbox(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
+        let current = || {
+            self.state
+                .read()
+                .sandboxes
+                .get(id)
+                .filter(|s| s.workload_uid.is_some())
+        };
+        if let Some(sandbox) = current() {
+            return Ok(sandbox);
+        }
+        // Coalesce RPC and background restoration for this registration.
+        let _fetch = self.fetch_lock.lock().await;
+        let mut changes = self.state.read().policies.subscribe();
+        if let Some(sandbox) = current() {
+            return Ok(sandbox);
+        }
+        // A demand notification is only a wakeup, never proof of readiness.
+        // Missing/rejected resources remain blocked until an accepted update arrives.
+        let demand = self.state.fetch_on_demand(SANDBOX_TYPE, id.clone());
+        tokio::pin!(demand);
+        let mut responded = false;
+        loop {
+            if let Some(sandbox) = current() {
+                return Ok(sandbox);
+            }
+            tokio::select! {
+                _ = &mut demand, if !responded => responded = true,
+                result = changes.changed() => {
+                    result?;
+                }
+            }
+        }
     }
 
     /// Check local state only. Preparation and recovery own demand and waiting.
@@ -241,8 +264,15 @@ impl SandboxManager {
     }
 
     fn get_sandbox(&self, id: &Strng) -> Result<Arc<Sandbox>, Error> {
-        self.lookup
-            .cached(id, &self.workload)?
+        let state = self.state.read();
+        let workload = state
+            .workloads
+            .find_by_reference(&self.workload)
+            .ok_or(Error::NotReady)?;
+        state
+            .sandboxes
+            .get_for_workload(id, &workload.uid)
+            .map_err(|_| Error::WorkloadMismatch)?
             .ok_or(Error::NotReady)
     }
 }
