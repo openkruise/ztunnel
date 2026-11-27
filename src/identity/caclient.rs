@@ -24,8 +24,8 @@ use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
 use tracing::{debug, error, instrument, warn};
 
 use crate::config::RootCert;
+use crate::identity::Identity;
 use crate::identity::auth::AuthSource;
-use crate::identity::manager::Identity;
 use crate::identity::{Error, WorkloadIdentity};
 use crate::tls::{self, RootCertManager, TlsGrpcChannel, control_plane_client_config};
 use crate::xds::istio::ca::IstioCertificateRequest;
@@ -278,16 +278,14 @@ pub mod mock {
             &self,
             id: &Identity,
         ) -> Result<tls::WorkloadCertificate, Error> {
-            let Identity::Spiffe {
-                trust_domain: td,
-                namespace: ns,
-                ..
-            } = id;
-            if td == "error" {
-                return Err(match ns.as_str() {
-                    "forgotten" => Error::Forgotten,
-                    _ => panic!("cannot parse injected error: {ns}"),
-                });
+            if id.trust_domain() == "error" {
+                return Err(
+                    if id.to_strng().starts_with("spiffe://error/ns/forgotten/sa/") {
+                        Error::Forgotten
+                    } else {
+                        panic!("cannot parse injected error: {id}")
+                    },
+                );
             }
 
             if self.cfg.fetch_latency != Duration::ZERO {
@@ -363,11 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_identity() {
-        let id = Identity::Spiffe {
-            service_account: "wrong-sa".into(),
-            namespace: "foo".into(),
-            trust_domain: "cluster.local".into(),
-        };
+        let id = Identity::from_parts("cluster.local".into(), "foo".into(), "wrong-sa".into());
         let certs = tls::mock::generate_test_certs(
             &id.into(),
             Duration::from_secs(0),

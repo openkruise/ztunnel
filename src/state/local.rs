@@ -87,18 +87,14 @@ pub(super) fn build(config: &Config, local: &LocalConfig) -> ProxyState {
 }
 
 fn workload(uid: Strng, identity: &Identity) -> Workload {
-    let Identity::Spiffe {
-        trust_domain,
-        namespace,
-        service_account,
-    } = identity;
     Workload {
         name: uid.clone(),
         workload_name: uid.clone(),
         uid,
-        namespace: namespace.clone(),
-        trust_domain: trust_domain.clone(),
-        service_account: service_account.clone(),
+        namespace: Strng::default(),
+        trust_domain: identity.trust_domain(),
+        service_account: Strng::default(),
+        principal: Some(identity.clone()),
         protocol: InboundProtocol::HBONE,
         workload_ips: vec![],
         waypoint: None,

@@ -193,11 +193,17 @@ pub async fn build_with_cert(
         })?;
     } else {
         tracing::info!("proxy mode enabled");
-        let wli = config
-            .proxy_workload_information
-            .clone()
-            .expect("proxy_workload_information is required for dedicated mode");
-        let proxies = proxy_gen.new_proxies_for_dedicated(wli).await?;
+        let workload = match &config.discovery {
+            crate::config::DiscoveryConfig::Local(local) => {
+                crate::state::WorkloadReference::Uid(local.workload_id.clone())
+            }
+            crate::config::DiscoveryConfig::Xds => config
+                .proxy_workload_information
+                .clone()
+                .expect("proxy_workload_information is required for dedicated mode")
+                .into(),
+        };
+        let proxies = proxy_gen.new_proxies_for_dedicated(workload).await?;
         match proxies.proxy {
             Some(proxy) => {
                 proxy_addresses = Some(proxy.addresses());

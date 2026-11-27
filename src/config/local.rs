@@ -19,7 +19,6 @@ use hyper::http::uri::Authority;
 
 use super::Error;
 use crate::identity::Identity;
-use crate::state::WorkloadInfo;
 use crate::strng::Strng;
 
 const DISCOVERY_MODE: &str = "DISCOVERY_MODE";
@@ -85,21 +84,6 @@ impl FromStr for GatewayEndpoint {
     }
 }
 
-impl LocalConfig {
-    pub fn workload_info(&self) -> WorkloadInfo {
-        let Identity::Spiffe {
-            namespace,
-            service_account,
-            ..
-        } = &self.identity;
-        WorkloadInfo {
-            name: self.workload_id.to_string(),
-            namespace: namespace.to_string(),
-            service_account: service_account.to_string(),
-        }
-    }
-}
-
 pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
     match super::parse::<String>(DISCOVERY_MODE)?.as_deref() {
         None | Some("xds") => Ok(DiscoveryConfig::Xds),
@@ -116,10 +100,10 @@ pub(super) fn parse() -> Result<DiscoveryConfig, Error> {
             Ok(DiscoveryConfig::Local(Box::new(LocalConfig {
                 workload_id: workload_id.into(),
                 workload_ip: super::parse(INSTANCE_IP)?.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                identity: identity(WORKLOAD_IDENTITY)?,
+                identity: required(WORKLOAD_IDENTITY)?,
                 gateway: LocalGateway {
                     address: required(EGRESS_GATEWAY_ADDRESS)?,
-                    identity: identity(EGRESS_GATEWAY_IDENTITY)?,
+                    identity: required(EGRESS_GATEWAY_IDENTITY)?,
                 },
                 sandbox_id: sandbox_id.map(Into::into),
             })))
@@ -138,21 +122,6 @@ where
 {
     super::parse(name)?
         .ok_or_else(|| Error::InvalidState(format!("{name} is required in local mode")))
-}
-
-fn identity(name: &str) -> Result<Identity, Error> {
-    let identity = required(name)?;
-    let Identity::Spiffe {
-        trust_domain,
-        namespace,
-        service_account,
-    } = &identity;
-    if trust_domain.is_empty() || namespace.is_empty() || service_account.is_empty() {
-        return Err(Error::InvalidState(format!(
-            "{name} must have a nonempty trust domain, namespace and service account"
-        )));
-    }
-    Ok(identity)
 }
 
 #[cfg(test)]
@@ -209,12 +178,12 @@ mod tests {
                     panic!("expected local configuration");
                 };
                 assert_eq!(config.proxy_mode, ProxyMode::Dedicated);
+                assert!(config.proxy_workload_information.is_none());
+                assert_eq!(local.workload_id, "vm-123");
                 assert_eq!(
-                    config.proxy_workload_information,
-                    Some(local.workload_info())
+                    local.identity.to_string(),
+                    "spiffe://agentio.local/workloads/vm-123"
                 );
-                assert_eq!(local.workload_info().name, "vm-123");
-                assert_eq!(local.workload_info().namespace, "vm");
                 assert!(config.xds_address.is_none());
                 assert!(!config.dns_proxy);
                 assert_eq!(
@@ -234,6 +203,7 @@ mod tests {
             ("xds", "DISCOVERY_MODE", Some("xds"), None),
             ("local", "DISCOVERY_MODE", Some("local"), None),
             ("sandbox", "SANDBOX_ID", Some("sandbox-123"), None),
+            ("pod-metadata", "PROXY_WORKLOAD_INFO", Some("unused"), None),
             (
                 "xds-address",
                 "XDS_ADDRESS",
@@ -339,12 +309,12 @@ mod tests {
                 .env("WORKLOAD_ID", "vm-123")
                 .env(
                     "WORKLOAD_IDENTITY",
-                    "spiffe://agentio.local/ns/vm/sa/tunnel",
+                    "spiffe://agentio.local/workloads/vm-123",
                 )
                 .env("EGRESS_GATEWAY_ADDRESS", "egress.example:15008")
                 .env(
                     "EGRESS_GATEWAY_IDENTITY",
-                    "spiffe://agentio.local/ns/gateway/sa/porter",
+                    "spiffe://agentio.local/gateways/porter",
                 )
                 .env("CA_ADDRESS", "ca.example:15012");
             if let Some(value) = value {

@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
 
 use crate::drain::DrainWatcher;
-use crate::state::{DemandProxyState, WorkloadInfo};
+use crate::state::{DemandProxyState, WorkloadReference};
 use crate::time::Debouncer;
 
 use super::backend::{Backend, BackendBuilder};
@@ -31,7 +30,7 @@ pub struct FirewallController {
     state: DemandProxyState,
     stop: DrainWatcher,
     backend: Box<dyn Backend>,
-    workload_info: Arc<WorkloadInfo>,
+    workload: WorkloadReference,
     debounce_interval: Duration,
     max_debounce_time: Duration,
     metrics: Metrics,
@@ -42,14 +41,14 @@ impl FirewallController {
         state: DemandProxyState,
         stop: DrainWatcher,
         detected: FirewallBackend,
-        workload_info: Arc<WorkloadInfo>,
+        workload: impl Into<WorkloadReference>,
         metrics: Metrics,
     ) -> Self {
         Self::new_with_debounce(
             state,
             stop,
             detected,
-            workload_info,
+            workload,
             DEFAULT_FIREWALL_DEBOUNCE_INTERVAL,
             DEFAULT_FIREWALL_MAX_DEBOUNCE_TIME,
             metrics,
@@ -60,19 +59,22 @@ impl FirewallController {
         state: DemandProxyState,
         stop: DrainWatcher,
         detected: FirewallBackend,
-        workload_info: Arc<WorkloadInfo>,
+        workload: impl Into<WorkloadReference>,
         debounce_interval: Duration,
         max_debounce_time: Duration,
         metrics: Metrics,
     ) -> Self {
-        let backend = BackendBuilder::new(detected)
-            .with_workload_info(&workload_info)
-            .build();
+        let workload = workload.into();
+        let mut backend = BackendBuilder::new(detected);
+        if let WorkloadReference::Kubernetes(info) = &workload {
+            backend = backend.with_workload_info(info);
+        }
+        let backend = backend.build();
         Self {
             state,
             stop,
             backend,
-            workload_info,
+            workload,
             debounce_interval,
             max_debounce_time,
             metrics,
@@ -84,7 +86,7 @@ impl FirewallController {
         applied_hash: Option<u64>,
     ) -> Option<(crate::firewall::RuleSet, u64)> {
         let state = self.state.read();
-        convert::resolve_workload_firewall(&state, &self.workload_info, applied_hash)
+        convert::resolve_workload_firewall(&state, &self.workload, applied_hash)
     }
 
     async fn drain_cleanup(&self) {

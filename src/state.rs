@@ -131,6 +131,47 @@ impl WorkloadInfo {
     }
 }
 
+/// Select the workload represented by a proxy. Local bootstrap has a stable UID;
+/// Kubernetes discovery can resolve the legacy Pod metadata before its UID is known.
+#[derive(Debug, Clone)]
+pub enum WorkloadReference {
+    Uid(Strng),
+    Kubernetes(Arc<WorkloadInfo>),
+}
+
+impl fmt::Display for WorkloadReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Uid(uid) => fmt::Display::fmt(uid, f),
+            Self::Kubernetes(info) => fmt::Display::fmt(info, f),
+        }
+    }
+}
+
+impl From<WorkloadInfo> for WorkloadReference {
+    fn from(info: WorkloadInfo) -> Self {
+        Self::Kubernetes(Arc::new(info))
+    }
+}
+
+impl From<Arc<WorkloadInfo>> for WorkloadReference {
+    fn from(info: Arc<WorkloadInfo>) -> Self {
+        Self::Kubernetes(info)
+    }
+}
+
+impl From<&WorkloadInfo> for WorkloadReference {
+    fn from(info: &WorkloadInfo) -> Self {
+        info.clone().into()
+    }
+}
+
+impl From<&WorkloadReference> for WorkloadReference {
+    fn from(reference: &WorkloadReference) -> Self {
+        reference.clone()
+    }
+}
+
 #[derive(Educe, Debug, Clone, Eq, serde::Serialize)]
 #[educe(PartialEq, Hash)]
 pub struct ProxyRbacContext {
@@ -628,9 +669,10 @@ impl DemandProxyState {
     // when we get it, or nothing if the timeout is exceeded, whichever happens first
     pub async fn wait_for_workload(
         &self,
-        wl: &WorkloadInfo,
+        wl: impl Into<WorkloadReference>,
         deadline: Duration,
     ) -> Option<Arc<Workload>> {
+        let wl = wl.into();
         debug!(%wl, "wait for workload");
 
         // Take a watch listener *before* checking state (so we don't miss anything)
@@ -638,7 +680,7 @@ impl DemandProxyState {
 
         debug!(%wl, "got sub, waiting for workload");
 
-        if let Some(wl) = self.find_by_info(wl) {
+        if let Some(wl) = self.read().workloads.find_by_reference(&wl) {
             return Some(wl);
         }
 
@@ -654,18 +696,12 @@ impl DemandProxyState {
                     break None;
                 },
                 _ = wl_sub.changed() => {
-                    if let Some(wl) = self.find_by_info(wl) {
+                    if let Some(wl) = self.read().workloads.find_by_reference(&wl) {
                         break Some(wl);
                     }
                 }
             }
         }
-    }
-
-    /// Finds the workload by workload information, as an arc.
-    /// Note: this does not currently support on-demand.
-    fn find_by_info(&self, wl: &WorkloadInfo) -> Option<Arc<Workload>> {
-        self.read().workloads.find_by_info(wl)
     }
 
     // fetch_workload_by_address looks up a Workload by address.
@@ -916,8 +952,10 @@ mod tests {
         assert!(!state_manager.state().supports_on_demand(&xds::ADDRESS_TYPE));
     }
 
+    #[test_case(false; "kubernetes")]
+    #[test_case(true; "uid")]
     #[tokio::test]
-    async fn test_wait_for_workload() {
+    async fn test_wait_for_workload(by_uid: bool) {
         let mut state = ProxyState::new(None);
         let delayed_wl = Arc::new(test_helpers::test_default_workload());
         state.workloads.insert(delayed_wl.clone());
@@ -932,10 +970,15 @@ mod tests {
             metrics,
         );
 
-        let want = WorkloadInfo {
-            name: delayed_wl.name.to_string(),
-            namespace: delayed_wl.namespace.to_string(),
-            service_account: delayed_wl.service_account.to_string(),
+        let want = if by_uid {
+            WorkloadReference::Uid(delayed_wl.uid.clone())
+        } else {
+            WorkloadInfo {
+                name: delayed_wl.name.to_string(),
+                namespace: delayed_wl.namespace.to_string(),
+                service_account: delayed_wl.service_account.to_string(),
+            }
+            .into()
         };
 
         test_helpers::assert_eventually(
@@ -974,8 +1017,10 @@ mod tests {
         .await;
     }
 
+    #[test_case(false; "kubernetes")]
+    #[test_case(true; "uid")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_wait_for_workload_eventually() {
+    async fn test_wait_for_workload_eventually(by_uid: bool) {
         initialize_telemetry();
         let state = ProxyState::new(None);
         let wrap_state = Arc::new(RwLock::new(state));
@@ -999,10 +1044,15 @@ mod tests {
         );
 
         // Some from Address
-        let want = WorkloadInfo {
-            name: delayed_wl.name.to_string(),
-            namespace: delayed_wl.namespace.to_string(),
-            service_account: delayed_wl.service_account.to_string(),
+        let want = if by_uid {
+            WorkloadReference::Uid(delayed_wl.uid.clone())
+        } else {
+            WorkloadInfo {
+                name: delayed_wl.name.to_string(),
+                namespace: delayed_wl.namespace.to_string(),
+                service_account: delayed_wl.service_account.to_string(),
+            }
+            .into()
         };
 
         let expected_wl = delayed_wl.clone();
@@ -1171,11 +1221,11 @@ mod tests {
         crate::state::ProxyRbacContext {
             sandbox: None,
             conn: rbac::Connection {
-                src_identity: Some(Identity::Spiffe {
-                    trust_domain: "cluster.local".into(),
-                    namespace: "default".into(),
-                    service_account: src_svc_acct.to_string().into(),
-                }),
+                src_identity: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    "default".into(),
+                    src_svc_acct.to_string().into(),
+                )),
                 src: std::net::SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::new(192, 168, 1, 1),
                     1234,

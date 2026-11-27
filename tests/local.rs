@@ -39,8 +39,8 @@ use ztunnel::xds::istio::ca::istio_certificate_service_server::{
 };
 use ztunnel::xds::istio::ca::{IstioCertificateRequest, IstioCertificateResponse};
 
-const SOURCE: &str = "spiffe://cluster.local/ns/vm/sa/tunnel";
-const GATEWAY: &str = "spiffe://cluster.local/ns/gateway/sa/porter";
+const SOURCE: &str = "spiffe://cluster.local/workloads/vm-123";
+const GATEWAY: &str = "spiffe://cluster.local/gateways/porter";
 
 fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
     let mut config = test_config();
@@ -54,7 +54,7 @@ fn local_config(gateway: SocketAddr, sandbox: Option<&str>) -> Config {
         },
         sandbox_id: sandbox.map(Into::into),
     };
-    config.proxy_workload_information = Some(local.workload_info());
+    config.proxy_workload_information = None;
     config.discovery = DiscoveryConfig::Local(Box::new(local));
     config.local_xds_config = None;
     config.xds_address = None;
@@ -361,13 +361,35 @@ async fn control_plane(
 #[tokio::test]
 async fn local_csr_renews_without_opening_ads() {
     helpers::initialize_telemetry();
-    let (config, mut requests, paths) = control_plane(false, None).await;
+    let (gateway, mut forwarded) = gateway().await;
+    let (mut config, mut requests, paths) = control_plane(false, None).await;
+    let DiscoveryConfig::Local(local) = &mut config.discovery else {
+        unreachable!();
+    };
+    local.gateway.address = gateway.to_string().parse().unwrap();
     let manager = Arc::new(SecretManager::new(Arc::new(config.clone())).await.unwrap());
     let app = ztunnel::app::build_with_cert(Arc::new(config), manager.clone())
         .await
         .unwrap();
-    TestApp::from((&app, manager)).ready().await;
+    let client = TestApp::from((&app, manager));
+    client.ready().await;
     let first = requests.recv().await.unwrap();
+    // Use the issued non-Kubernetes certificate on the shared HBONE path.
+    let mut stream = client
+        .socks5_connect(
+            DestinationAddr::Ip("203.0.113.7:443".parse().unwrap()),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await;
+    stream.write_all(b"csr-to-hbone").await.unwrap();
+    let mut received = [0u8; 12];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received, b"csr-to-hbone");
+    assert_eq!(forwarded.recv().await.unwrap().identity, SOURCE);
+    drop(stream);
     let renewal = timeout(Duration::from_secs(6), requests.recv())
         .await
         .unwrap()

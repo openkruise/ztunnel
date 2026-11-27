@@ -63,11 +63,11 @@ The gateway applies policy.
 ```shell
 DISCOVERY_MODE=local \
 WORKLOAD_ID=vm-123 \
-WORKLOAD_IDENTITY=spiffe://agentio.local/ns/vm/sa/tunnel \
+WORKLOAD_IDENTITY=spiffe://agentio.local/workloads/vm-123 \
 INSTANCE_IP=10.0.0.10 \
 SANDBOX_ID=sandbox-123 \
 EGRESS_GATEWAY_ADDRESS=egress.example.com:15008 \
-EGRESS_GATEWAY_IDENTITY=spiffe://agentio.local/ns/gateway/sa/porter \
+EGRESS_GATEWAY_IDENTITY=spiffe://agentio.local/gateways/porter \
 CA_ADDRESS=https://agentiod.example.com:15012 \
 CA_ROOT_CA=/etc/agentio/root-cert.pem \
 AUTH_TOKEN=/run/agentio/bootstrap.token \
@@ -85,13 +85,24 @@ AUTH_TOKEN=/run/agentio/bootstrap.token \
 | `CA_ADDRESS` | Required certificate service endpoint. |
 | `CA_ROOT_CA`, `AUTH_TOKEN`, `SECRET_TTL` | Existing CA trust, bootstrap credential and requested certificate lifetime settings. |
 
-Identities use the existing `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>`
-format. These names do not require Kubernetes objects. The CA must authenticate
-the bootstrap credential and authorize the requested identity. Non-Kubernetes
+Identities are complete SPIFFE URIs; their paths do not require a namespace or
+ServiceAccount. `WORKLOAD_ID` selects the local workload by UID independently of
+its certificate identity. Local mode ignores `PROXY_WORKLOAD_INFO` and does not
+require Pod metadata. The CA must authenticate the bootstrap credential and
+authorize the requested identity. Non-Kubernetes
 credentials require the corresponding CA authentication and authorization
 adapter; selecting local mode does not add that adapter to agentiod.
 The gateway must already be able to resolve and validate the Sandbox's binding
 to the authenticated workload; setting `SANDBOX_ID` does not register it.
+
+The bootstrap adapters meet at the proxy state: local configuration creates a
+workload with its UID and explicit principal, while the xDS adapter translates
+legacy namespace/ServiceAccount fields into a SPIFFE identity. The shared proxy
+looks up its workload through `WorkloadReference` (UID or Kubernetes metadata)
+and obtains certificates using `Workload::identity()`. The identity module treats
+SPIFFE paths as opaque; TLS still checks the trust domain and the expected peer
+identity. Certificate acquisition, renewal, HBONE forwarding and connection
+pools are shared by both modes. Existing xDS wire formats remain compatible.
 
 Local mode defaults to `PROXY_MODE=dedicated` and binds listeners in the process's
 current network namespace. The external runtime owns network setup and transparent

@@ -797,8 +797,8 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         None if matches!(discovery, DiscoveryConfig::Local(_)) => ProxyMode::Dedicated,
         None => ProxyMode::Shared,
     };
-    let proxy_workload_information = if let DiscoveryConfig::Local(local) = &discovery {
-        Some(local.workload_info())
+    let proxy_workload_information = if matches!(discovery, DiscoveryConfig::Local(_)) {
+        None
     } else if proxy_mode != ProxyMode::Shared {
         let info = if let Some(raw) = parse::<String>(PROXY_WORKLOAD_INFO)? {
             let parts: Vec<&str> = raw.split('/').collect();

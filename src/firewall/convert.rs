@@ -15,7 +15,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::rbac::firewall_rulesets;
-use crate::state::{ProxyState, WorkloadInfo};
+use crate::state::{ProxyState, WorkloadReference};
 
 use super::types::RuleSet;
 
@@ -23,10 +23,10 @@ use super::types::RuleSet;
 /// Returns None when the Workload is missing or the applied policy hash is unchanged.
 pub fn resolve_workload_firewall(
     state: &ProxyState,
-    info: &WorkloadInfo,
+    workload: impl Into<WorkloadReference>,
     applied_hash: Option<u64>,
 ) -> Option<(RuleSet, u64)> {
-    let workload = state.workloads.find_by_info(info)?;
+    let workload = state.workloads.find_by_reference(&workload.into())?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workload.uid.hash(&mut hasher);
     for policy in workload.traffic_policies(&state.policies) {

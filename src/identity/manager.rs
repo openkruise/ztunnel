@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,25 +15,21 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::fmt;
-use std::fmt::{Formatter, Write};
+use std::fmt::{self, Formatter};
 use std::hash::{Hash, RandomState};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::config::ProxyMode;
 use async_trait::async_trait;
 
-use prometheus_client::encoding::{EncodeLabelValue, LabelValueEncoder};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::{Duration, Instant, sleep_until};
 
-use crate::{strng, tls};
+use crate::tls;
 
 use super::CaClient;
-use super::Error::{self, Spiffe};
+use super::{Error, Identity};
 
-use crate::strng::Strng;
 use backoff::{ExponentialBackoff, backoff::Backoff};
 use keyed_priority_queue::KeyedPriorityQueue;
 
@@ -40,108 +37,6 @@ const CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL: Duration = Duration::from_s
 
 /// Default trust domain to use if not otherwise specified.
 pub const DEFAULT_TRUST_DOMAIN: &str = "cluster.local";
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
-pub enum Identity {
-    Spiffe {
-        trust_domain: Strng,
-        namespace: Strng,
-        service_account: Strng,
-    },
-}
-
-impl EncodeLabelValue for Identity {
-    fn encode(&self, writer: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
-        writer.write_str(&self.to_string())
-    }
-}
-
-impl serde::Serialize for Identity {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.to_string().serialize(serializer)
-    }
-}
-
-impl FromStr for Identity {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const URI_PREFIX: &str = "spiffe://";
-        const SERVICE_ACCOUNT: &str = "sa";
-        const NAMESPACE: &str = "ns";
-        if !s.starts_with(URI_PREFIX) {
-            return Err(Spiffe(s.to_string()));
-        }
-        let split: Vec<_> = s[URI_PREFIX.len()..].split('/').collect();
-        if split.len() != 5 {
-            return Err(Spiffe(s.to_string()));
-        }
-        if split[1] != NAMESPACE || split[3] != SERVICE_ACCOUNT {
-            return Err(Spiffe(s.to_string()));
-        }
-        Ok(Identity::Spiffe {
-            trust_domain: split[0].into(),
-            namespace: split[2].into(),
-            service_account: split[4].into(),
-        })
-    }
-}
-
-impl fmt::Display for Identity {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Identity::Spiffe {
-                trust_domain,
-                namespace,
-                service_account,
-            } => write!(
-                f,
-                "spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}"
-            ),
-        }
-    }
-}
-
-impl Identity {
-    pub fn from_parts(td: Strng, ns: Strng, sa: Strng) -> Identity {
-        Identity::Spiffe {
-            trust_domain: td,
-            namespace: ns,
-            service_account: sa,
-        }
-    }
-
-    pub fn to_strng(self: &Identity) -> Strng {
-        match self {
-            Identity::Spiffe {
-                trust_domain,
-                namespace,
-                service_account,
-            } => strng::format!("spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}"),
-        }
-    }
-
-    pub fn trust_domain(&self) -> Strng {
-        match self {
-            Identity::Spiffe { trust_domain, .. } => trust_domain.clone(),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "testing"))]
-impl Default for Identity {
-    fn default() -> Self {
-        const SERVICE_ACCOUNT: &str = "ztunnel";
-        const NAMESPACE: &str = "istio-system";
-        Identity::Spiffe {
-            trust_domain: DEFAULT_TRUST_DOMAIN.into(),
-            namespace: NAMESPACE.into(),
-            service_account: SERVICE_ACCOUNT.into(),
-        }
-    }
-}
 
 #[async_trait]
 pub trait CaClientTrait: Send + Sync {
@@ -753,6 +648,7 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
     use std::time;
 
     use matches::assert_matches;
@@ -765,11 +661,11 @@ mod tests {
 
     async fn stress_many_ids(sm: Arc<SecretManager>, iterations: u32) {
         for i in 0..iterations {
-            let id = identity::Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "istio-system".into(),
-                service_account: strng::format!("ztunnel{i}"),
-            };
+            let id = identity::Identity::from_parts(
+                "cluster.local".into(),
+                "istio-system".into(),
+                strng::format!("ztunnel{i}"),
+            );
             sm.fetch_certificate(&id)
                 .await
                 .expect("Didn't get a cert as expected.");
@@ -918,19 +814,11 @@ mod tests {
     }
 
     fn identity(name: &str) -> Identity {
-        Identity::Spiffe {
-            trust_domain: "test".into(),
-            namespace: "test".into(),
-            service_account: name.into(),
-        }
+        Identity::from_parts("test".into(), "test".into(), name.into())
     }
 
     fn identity_n(name: &str, n: u8) -> Identity {
-        Identity::Spiffe {
-            trust_domain: "test".into(),
-            namespace: "test".into(),
-            service_account: strng::format!("{name}{n}"),
-        }
+        Identity::from_parts("test".into(), "test".into(), strng::format!("{name}{n}"))
     }
 
     #[tokio::test(start_paused = true)]
@@ -1202,38 +1090,27 @@ mod tests {
     fn identity_from_string() {
         assert_eq!(
             Identity::from_str("spiffe://cluster.local/ns/namespace/sa/service-account").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "namespace".into(),
-                service_account: "service-account".into(),
-            })
+            Some(Identity::from_parts(
+                "cluster.local".into(),
+                "namespace".into(),
+                "service-account".into()
+            ))
         );
         assert_eq!(
             Identity::from_str("spiffe://td/ns/ns/sa/sa").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td".into(),
-                namespace: "ns".into(),
-                service_account: "sa".into(),
-            })
+            Some(Identity::from_parts("td".into(), "ns".into(), "sa".into()))
         );
         assert_eq!(
             Identity::from_str("spiffe://td.with.dots/ns/ns.with.dots/sa/sa.with.dots").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td.with.dots".into(),
-                namespace: "ns.with.dots".into(),
-                service_account: "sa.with.dots".into(),
-            })
-        );
-        assert_eq!(
-            Identity::from_str("spiffe://td/ns//sa/").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td".into(),
-                namespace: "".into(),
-                service_account: "".into()
-            })
+            Some(Identity::from_parts(
+                "td.with.dots".into(),
+                "ns.with.dots".into(),
+                "sa.with.dots".into()
+            ))
         );
         assert_matches!(Identity::from_str("td/ns/ns/sa/sa"), Err(_));
-        assert_matches!(Identity::from_str("spiffe://td/ns/ns/sa"), Err(_));
+        assert!(Identity::from_str("spiffe://td/workloads/vm-123").is_ok());
+        assert_matches!(Identity::from_str("spiffe://td/ns//sa/"), Err(_));
         assert_matches!(Identity::from_str("spiffe://td/ns/ns/sa/sa/"), Err(_));
         assert_matches!(Identity::from_str("spiffe://td/ns/ns/foobar/sa/"), Err(_));
     }

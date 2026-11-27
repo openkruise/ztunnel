@@ -189,6 +189,7 @@ pub fn mock_default_service() -> Service {
 
 pub fn test_default_workload() -> Workload {
     Workload {
+        principal: None,
         workload_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         waypoint: None,
         protocol: Default::default(),
